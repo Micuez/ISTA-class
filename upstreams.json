@@ -1,0 +1,26 @@
+{
+  "EBT-LISTA": {
+    "url": "https://github.com/lzalza/EBT-LISTA.git",
+    "commit": "efe0a317578f47b2ea8defed0fc04cc0044f03f3",
+    "code_dir": "code",
+    "model": "LISTA_cpss"
+  },
+  "HLISTA": {
+    "url": "https://github.com/ZhengZY-EE/Hybrid_ISTA.git",
+    "commit": "ddde3c5867bfb453741d0c2e2cca507e6070994a",
+    "code_dir": ".",
+    "model": "Hybrid_LISTA_cpss"
+  },
+  "ALISTA": {
+    "url": "https://github.com/VITA-Group/ALISTA.git",
+    "commit": "23f3637f01066a919d37af76fd60ee03d33188b9",
+    "code_dir": ".",
+    "model": "ALISTA"
+  },
+  "NA-ALISTA": {
+    "url": "https://github.com/feeds/na-alista.git",
+    "commit": "40597f05e3ef179e4ae44173d25674640db7d27a",
+    "code_dir": ".",
+    "model": "NA_ALISTA_UR_128"
+  }
+}

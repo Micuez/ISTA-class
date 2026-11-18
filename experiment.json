@@ -1,0 +1,8 @@
+{
+  "seed": 20261118,
+  "measurements": 250,
+  "signal_dimension": 500,
+  "nonzeros": 50,
+  "snr_db": [40, 20, 10, 5],
+  "clean_signals": {"train": 10000, "val": 1000, "test": 2000}
+}

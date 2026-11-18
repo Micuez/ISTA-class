@@ -1,0 +1,118 @@
+--- a/main.py
++++ b/main.py
+@@ -738,21 +738,10 @@
+ 
+ 
+ def run_sc_train(config) :
+-    """Load problem."""
+-    if not os.path.exists(config.probfn):
+-        raise ValueError ("Problem file not found.")
+-    else:
+-        p = problem.load_problem(config.probfn)
+-
+-    """Set up model."""
+-    model = setup_model (config, A=p.A)
+-
+-    """Set up input."""
+-    config.SNR = np.inf if config.SNR == 'inf' else float (config.SNR)
+-    y_, x_, y_val_, x_val_ = (
+-        train.setup_input_sc (
+-            config.test, p, config.tbs, config.vbs, config.fixval,
+-            config.supp_prob, config.SNR, config.magdist, **config.distargs))
++    from experiment_inputs import open_data, tf_training_inputs
++    experiment = open_data()
++    model = setup_model(config, A=experiment.A)
++    y_, x_, y_val_, x_val_ = tf_training_inputs(experiment, config.tbs)
+ 
+     """Set up training."""
+     # if 'Hybrid_ELISTA' in config.model:
+@@ -1192,28 +1181,13 @@
+     Test model.
+     """
+ 
+-    """Load problem."""
+-    if not os.path.exists (config.probfn):
+-        raise ValueError ("Problem file not found.")
+-    else:
+-        p = problem.load_problem (config.probfn)
+-
+-    """Load testing data."""
+-    xt = np.load (config.xtest)
++    from experiment_inputs import open_data, tf_test_inputs
++    experiment = open_data()
++    input_, xt = tf_test_inputs(experiment)
++    model = setup_model(config, A=experiment.A)
++    config.resfn += "_{}dB".format(os.environ["RECOVERY_TEST_DB"])
+     zeros_pos = np.logical_not(xt)
+     not_zeros_pos = np.logical_not(zeros_pos)
+-    # xt_2norm = np.linalg.norm(xt, ord=2)
+-
+-    """Set up input for testing."""
+-    config.SNR = np.inf if config.SNR == 'inf' else float (config.SNR)
+-    input_, label_ = (
+-        train.setup_input_sc (config.test, p, xt.shape [1], None, False,
+-                              config.supp_prob, config.SNR,
+-                              config.magdist, **config.distargs))
+-
+-
+-    """Set up model."""
+-    model = setup_model (config , A=p.A)
+     xhs_ = model.inference (input_, None)
+ 
+     if config.model[0] == 'H':
+@@ -1264,7 +1238,7 @@
+ 
+         # test model
+         for xh_ in xhs_ :
+-            xh = sess.run (xh_ , feed_dict={label_:xt})
++            xh = sess.run (xh_)
+             xh_2norm = np.linalg.norm(xh, ord=2)
+ 
+             # nmse:
+@@ -1301,7 +1275,7 @@
+         if config.model[0] == 'H':
+ 
+             if 'ISTA_ada_fixT' in config.model:
+-                lam_f_, eta_, del_, t_, al,  = sess.run ([lam_f_list, eta_list, delta_list, theta_list, alpha_list] , feed_dict={label_:xt})
++                lam_f_, eta_, del_, t_, al,  = sess.run ([lam_f_list, eta_list, delta_list, theta_list, alpha_list])
+                 Lam_ = [abs(l) for l in lam_f_]
+                 Theta_ = [abs(t) for t in t_]
+ 
+@@ -1311,7 +1285,7 @@
+                 print('eta:', eta_)
+             
+             elif 'ISTA_ada_freeT' in config.model:
+-                lam_f_, eta_, t_, = sess.run ([lam_f_list, eta_list, theta_list] , feed_dict={label_:xt})
++                lam_f_, eta_, t_, = sess.run ([lam_f_list, eta_list, theta_list])
+                 
+                 Lam_ = [abs(l) for l in lam_f_]
+                 Theta_ = [abs(t) for t in t_]
+@@ -1320,7 +1294,7 @@
+                 print('eta:', eta_)
+ 
+             elif 'LISTA' in config.model and 'ELISTA' not in config.model:
+-                t1, t2, al, u = sess.run ([theta1_list, theta2_list, alpha_list, u_list] , feed_dict={label_:xt})
++                t1, t2, al, u = sess.run ([theta1_list, theta2_list, alpha_list, u_list])
+                 alpha = []
+                 u_1norm = []
+                 
+@@ -1335,7 +1309,7 @@
+                 print('x_1norm', np.linalg.norm(xt, ord=1)/1000)
+                 
+             elif 'ELISTA' in config.model:
+-                al, u = sess.run ([alpha_list, u_list] , feed_dict={label_:xt})
++                al, u = sess.run ([alpha_list, u_list])
+                 alpha = []
+                 u_1norm = []
+                 
+--- a/models/Hybrid_LISTA_cpss.py
++++ b/models/Hybrid_LISTA_cpss.py
+@@ -193,7 +193,7 @@
+                     else: 
+                         vh_0 = tf.nn.relu(tf.nn.conv1d(vh_0, dnn_para_[i], stride=1, padding='SAME'))
+ 
+-                uh_ = tf.reshape(vh_0, tf.shape(vh_)) + vh_
++                uh_ = tf.transpose(tf.squeeze(vh_0, axis=2)) + vh_
+   
+                 # w_n
+                 res2_ = y_ - tf.matmul (self._kA_, uh_)

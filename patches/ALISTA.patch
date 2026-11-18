@@ -1,0 +1,68 @@
+--- a/main.py
++++ b/main.py
+@@ -269,21 +269,11 @@
+ 
+ 
+ def run_sc_train(config) :
+-    """Load problem."""
+-    if not os.path.exists(config.probfn):
+-        raise ValueError ("Problem file not found.")
+-    else:
+-        p = problem.load_problem(config.probfn)
+-
+-    """Set up model."""
+-    model = setup_model (config, A=p.A)
+-
+-    """Set up input."""
+-    config.SNR = np.inf if config.SNR == 'inf' else float (config.SNR)
+-    y_, x_, y_val_, x_val_ = (
+-        train.setup_input_sc (
+-            config.test, p, config.tbs, config.vbs, config.fixval,
+-            config.supp_prob, config.SNR, config.magdist, **config.distargs))
++    from experiment_inputs import open_data, tf_training_inputs
++    experiment = open_data()
++    config.W = str(experiment.root / "W.npy")
++    model = setup_model(config, A=experiment.A)
++    y_, x_, y_val_, x_val_ = tf_training_inputs(experiment, config.tbs)
+ 
+     """Set up training."""
+     stages = train.setup_sc_training (
+@@ -704,23 +694,12 @@
+     Test model.
+     """
+ 
+-    """Load problem."""
+-    if not os.path.exists (config.probfn):
+-        raise ValueError ("Problem file not found.")
+-    else:
+-        p = problem.load_problem (config.probfn)
+-
+-    """Load testing data."""
+-    xt = np.load (config.xtest)
+-    """Set up input for testing."""
+-    config.SNR = np.inf if config.SNR == 'inf' else float (config.SNR)
+-    input_, label_ = (
+-        train.setup_input_sc (config.test, p, xt.shape [1], None, False,
+-                              config.supp_prob, config.SNR,
+-                              config.magdist, **config.distargs))
+-
+-    """Set up model."""
+-    model = setup_model (config , A=p.A)
++    from experiment_inputs import open_data, tf_test_inputs
++    experiment = open_data()
++    config.W = str(experiment.root / "W.npy")
++    input_, xt = tf_test_inputs(experiment)
++    model = setup_model(config, A=experiment.A)
++    config.resfn += "_{}dB".format(os.environ["RECOVERY_TEST_DB"])
+     xhs_ = model.inference (input_, None)
+ 
+     """Create session and initialize the graph."""
+@@ -743,7 +722,7 @@
+ 
+         # test model
+         for xh_ in xhs_ :
+-            xh = sess.run (xh_ , feed_dict={label_:xt})
++            xh = sess.run (xh_)
+ 
+             # nmse:
+             loss = np.sum (np.square (xh - xt))

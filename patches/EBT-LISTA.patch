@@ -1,0 +1,86 @@
+--- a/code/main.py
++++ b/code/main.py
+@@ -27,7 +27,7 @@
+ def setup_model(config , **kwargs) :
+     untiedf = 'u' if config.untied else 't'
+     coordf = 'c' if config.coord  else 's'
+-    use_bias = True if config.SNR != 'inf' and config.bias else False
++    use_bias = config.bias  # The shared experiment uses finite observation SNRs.
+     if config.net == 'LISTA' :
+         """LISTA"""
+         config.model = ("LISTA_T{T}_lam{lam}_{untiedf}_{coordf}_{exp_id}"
+@@ -139,22 +139,10 @@
+ 
+ 
+ def run_sc_train(config) :
+-    """Load problem."""
+-    if not os.path.exists(config.probfn):
+-        print(config.probfn)
+-        raise ValueError ("Problem file not found.")
+-    else:
+-        p = problem.load_problem(config.probfn)
+-
+-    """Set up model."""
+-    model = setup_model (config, A=p.A)
+-
+-    """Set up input."""
+-    config.SNR = np.inf if config.SNR == 'inf' else float (config.SNR)
+-    y_, x_, y_val_, x_val_ = (
+-        train.setup_input_sc (
+-            config.test, p, config.tbs, config.vbs, config.fixval,
+-            config.supp_prob, config.SNR, config.magdist, **config.distargs))
++    from experiment_inputs import open_data, tf_training_inputs
++    experiment = open_data()
++    model = setup_model(config, A=experiment.A)
++    y_, x_, y_val_, x_val_ = tf_training_inputs(experiment, config.tbs)
+ 
+     """Set up training."""
+     stages = train.setup_sc_training (
+@@ -167,8 +155,6 @@
+     with tf.Session (config=tfconfig) as sess:
+         # graph initialization
+         sess.run (tf.global_variables_initializer ())
+-        print(sess.run(tf.norm(y_,axis=0)))
+-        print(sess.run(tf.norm(y_,axis=1)))
+         # start timer
+         start = time.time ()
+ 
+@@ -199,24 +185,11 @@
+     Test model.
+     """
+ 
+-    """Load problem."""
+-    if not os.path.exists (config.probfn):
+-        raise ValueError ("Problem file not found.")
+-    else:
+-        p = problem.load_problem (config.probfn)
+-
+-    """Load testing data."""
+-    xt = np.load (config.xtest)
+-    #print(xt)
+-    """Set up input for testing."""
+-    config.SNR = np.inf if config.SNR == 'inf' else float (config.SNR)
+-    input_, label_ = (
+-        train.setup_input_sc (config.test, p, xt.shape [1], None, False,
+-                              config.supp_prob, config.SNR,
+-                              config.magdist, **config.distargs))
+-
+-    """Set up model."""
+-    model = setup_model (config , A=p.A)
++    from experiment_inputs import open_data, tf_test_inputs
++    experiment = open_data()
++    input_, xt = tf_test_inputs(experiment)
++    model = setup_model(config, A=experiment.A)
++    config.resfn += "_{}dB".format(os.environ["RECOVERY_TEST_DB"])
+     xhs_ = model.inference (input_, None)
+ 
+     """Create session and initialize the graph."""
+@@ -242,7 +215,7 @@
+ 
+         # test model
+         for xh_ in xhs_ :
+-            xh = sess.run (xh_ , feed_dict={label_:xt})
++            xh = sess.run (xh_)
+ 
+             # nmse:
+             loss = np.sum (np.square (xh - xt))
