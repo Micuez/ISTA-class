@@ -1,6 +1,27 @@
 # 高噪声观测下的稀疏信号恢复
 
-给定已知字典 $A$ 和带噪观测 $y$，估计稀疏信号 $x$。五个条件为 40、20、10、5 dB 和无噪声（SNR 为无穷），每个条件独立训练、验证和测试。EBT-LISTA、HLISTA、ALISTA、ELISTA 各做逐层联合微调和端到端，NA-ALISTA 使用全深度端到端反传。种子 0 共 45 个模型。
+给定已知字典 $A$ 和带噪观测 $y$，估计稀疏信号 $x$。每个 SNR 独立训练、验证和测试。默认的 `baseline` 网格有 45 个任务，覆盖五个基线和含无噪声在内的五档观测。`six-methods` 网格加入 SALISTA，六种方法均覆盖四档有限噪声和两种训练方式。
+
+## 六法对比 · 种子 20261118
+
+在具备 CUDA 版 PyTorch 2.8 且已有 `data/main` 的机器上，从仓库根目录执行以下命令。首次建立固定数据的命令见本文的“服务器运行”一节。
+
+```bash
+python run_single_snr_grid.py --preset six-methods --seed 20261118
+```
+
+六种方法为 EBT-LISTA、HLISTA、ALISTA、ELISTA、NA-ALISTA、SALISTA。每种均展开 16 层，各做端到端与逐层训练，在 40、20、10、5 dB 上共保存 **48 份**检查点。`--dry-run` 可预览清单。调度器按可见 GPU 分配任务，每张卡同时运行一个任务。
+
+| 训练组 | 数据和逐层方式 |
+|---|---|
+| NA-ALISTA 与 SALISTA | 两者均按 NA 作者的实数协议在线采样。每轮生成 50,000 条 Bernoulli–Gaussian 信号，batch 512，使用 97 个完整批次。每条干净观测按自身样本标准差加噪。同一设备类型、相同种子和全局 epoch 对应相同信号、顺序与噪声随机流。NA 使用共享 LSTM，SALISTA 使用共享 GRU。逐层对照对当前完整前缀反传，最后两档低学习率联合微调。NA 的逐层日程是本仓库增加的实验条件。 |
+| 其余四法 | 每档固定 10,000 条训练信号，batch 64，每轮 157 次更新。逐层先训练新增参数，再两次微调当前前缀。 |
+
+六法共用同一份固定字典、验证集和测试集。按固定验证集线性 NMSE 选权重，每阶段等待 50 个 epoch。两个循环模型在两种日程均从 Adam 学习率 0.0002 起步，SALISTA 保留全零时的阈值缩放。在线训练的概率界同时计入随机支撑大小和随样本变化的噪声标准差。训练样本量、批大小、早停轮数均会影响比较，汇总表包含更新数和含验证的训练耗时。[正式配置](training.comparison.json) · [SALISTA 证书与缩放条件](SALISTA.md)
+
+默认输出为 `runs/six-methods-seed-20261118/`。`test_summary_seed_20261118.csv` 每行对应一份最终检查点的测试 NMSE、NMSE（dB）与 top-50 支撑 F1。`fixed_depth_val_nmse.csv` 和 `figures/` 保存同一检查点的验证深度曲线及端到端误差箱线图。可用 `python -m unittest -v test_comparison test_experiment test_salista` 复核运行约定。单种子结果仅描述本次抽样。
+
+SALISTA V3 支持端到端或递增深度训练。主字典在稀疏度 50 时的严格阈值会压零全部首层输出。SALISTA 短配置仅在某条非零更新将被全部压零时等比例降低该样本的阈值。四档训练观测在此配置下首层均产生非零输出，触发后的支撑保证需单独评估。模型、严格对照与复核命令见 [SALISTA 设计与验证记录](SALISTA.md)。
 
 ## 数据协议
 

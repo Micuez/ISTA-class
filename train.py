@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import perf_counter
 from typing import NamedTuple
 
 import numpy as np
@@ -14,20 +15,23 @@ import torch
 
 from dataset import RecoveryData, level_key
 from evaluation import evaluate, tensors
-from models import METHODS, NeuralALISTA, build_model
-from na_training import author_batches, author_holdout_score, sparse_signals
+from models import BASELINE_METHODS, METHODS, NeuralALISTA, SALISTA, build_model
+from na_training import author_batches, author_holdout_score, paired_author_batches, sparse_signals
 
 
 BASE = Path(__file__).resolve().parent
 MODES = ("end_to_end", "layerwise")
 DEFAULT_RUNS = Path("runs/single-snr-finetuned")
-EVALUATION_FILES = ("dataset.py", "models.py", "evaluation.py")
+EVALUATION_FILES = ("dataset.py", "models.py", "evaluation.py", "salista_constraints.py")
 # The initial release recorded only a full trainer hash. Its prediction and
 # scoring routines are identical to the evaluation revision recorded here.
 LEGACY_EVALUATORS = {
     "8cdb4a5282cfa1f86a3b7020d704819c9da5e82923387a08cbe8d27a8507911c":
         "e33783d3a46b7c21b13489d2ddc28847965e31e4967e524fa95eb716a3780fa7"
 }
+# Baseline predictions and metrics from the two pre-SALISTA evaluation revisions.
+BASELINE_EVALUATORS = {"e33783d3a46b7c21b13489d2ddc28847965e31e4967e524fa95eb716a3780fa7",
+                       "9ed6583231e2398f4b36745b1827acef80ced153bf068049f52a04ed60d3a8b5"}
 
 
 def write_json(path, obj):
@@ -49,13 +53,14 @@ class Phase(NamedTuple):
     lr: float
 
 
-def supported_modes(method):
-    return ("end_to_end",) if method == "NA-ALISTA" else MODES
+def supported_modes(method, na_shared_prefix=False):
+    return ("end_to_end",) if method == "NA-ALISTA" and not na_shared_prefix else MODES
 
 
 def stages(mode, config, method="ALISTA"):
-    if mode not in supported_modes(method):
-        raise ValueError(f"{method} supports {', '.join(supported_modes(method))}")
+    allowed = supported_modes(method, config.get("na_shared_prefix", False))
+    if mode not in allowed:
+        raise ValueError(f"{method} supports {', '.join(allowed)} for this configuration")
     depth = config["depth"]
     patience = config["early_stopping_patience"]
     if type(patience) is not int or patience < 1:
@@ -63,24 +68,37 @@ def stages(mode, config, method="ALISTA"):
     end_cap, layer_cap = config["max_epochs_end_to_end"], config["max_epochs_per_layer"]
     if type(end_cap) is not int or end_cap < 1 or type(layer_cap) is not int or layer_cap < 3:
         raise ValueError("Use a positive end-to-end budget and at least three epochs per layer")
+    recurrent = method in ("NA-ALISTA", "SALISTA")
+    recurrent_lr = config.get("recurrent_learning_rate") if recurrent else None
+    if recurrent_lr is not None and (not math.isfinite(recurrent_lr) or recurrent_lr <= 0):
+        raise ValueError("recurrent_learning_rate must be finite and positive")
     if method == "NA-ALISTA":
         schedule = config.get("na_schedule", "experiment")
         if schedule not in ("experiment", "author"):
             raise ValueError("Unknown NA-ALISTA schedule: " + str(schedule))
-        cap = 100 + 20 * depth if schedule == "author" else end_cap
-        return [Phase(depth, "end_to_end", cap, 0.0002)]
+        if schedule == "author" and (mode == "layerwise" or config.get("paired_author_online")):
+            raise ValueError("The author schedule uses its original end-to-end protocol")
+        if mode == "end_to_end":
+            cap = 100 + 20 * depth if schedule == "author" else end_cap
+            return [Phase(depth, "end_to_end", cap, 0.0002 if schedule == "author" or recurrent_lr is None else recurrent_lr)]
     if mode == "end_to_end":
-        return [Phase(depth, mode, end_cap, config["learning_rate"])]
+        return [Phase(depth, mode, end_cap, config["learning_rate"] if recurrent_lr is None else recurrent_lr)]
     factors = config.get("finetune_lr_factors", [0.2, 0.02])
     if len(factors) != 2 or not (0 < factors[1] < factors[0] < 1):
         raise ValueError("Expect two decreasing fine-tuning LR factors between 0 and 1")
-    base = config.get("layerwise_learning_rate", 0.0005)
+    base = config.get("layerwise_learning_rate", 0.0005) if recurrent_lr is None else recurrent_lr
     if not math.isfinite(base) or base <= 0:
         raise ValueError("layerwise_learning_rate must be finite and positive")
     quotient, remainder = divmod(layer_cap, 3)
+    shared_prefix = method == "NA-ALISTA" or (method == "SALISTA" and
+                    config.get("salista", {}).get("sharing", "shared") == "shared")
     plan = []
     for active in range(1, depth + 1):
-        for i, (name, factor) in enumerate(zip(("new_layer", "joint_1", "joint_2"), (1, *factors))):
+        if shared_prefix and active < depth:
+            plan.append(Phase(active, "prefix", layer_cap, base))
+            continue
+        first = "prefix" if shared_prefix else "new_layer"
+        for i, (name, factor) in enumerate(zip((first, "joint_1", "joint_2"), (1, *factors))):
             plan.append(Phase(active, name, quotient + int(i < remainder), base * factor))
     return plan
 
@@ -110,15 +128,21 @@ def trainable_parameters(model, phase, depth):
     model.requires_grad_(phase == "end_to_end")
     if phase != "end_to_end":
         if isinstance(model, NeuralALISTA):
-            raise ValueError("NA-ALISTA requires full end-to-end backpropagation")
-        if phase == "new_layer":
+            if phase not in ("prefix", "joint_1", "joint_2"):
+                raise ValueError("Shared NA-ALISTA uses full prefix backpropagation")
+            model.regressor.requires_grad_(True)
+        elif phase == "prefix" and isinstance(model, SALISTA) and model.sharing == "shared":
+            model.stage_module(depth).requires_grad_(True)
+        elif phase == "new_layer":
+            if isinstance(model, SALISTA) and model.sharing == "shared":
+                raise ValueError("Shared SALISTA uses full prefix backpropagation")
             model.stage_module(depth).requires_grad_(True)
         elif phase in ("joint_1", "joint_2"):
             for layer in model.layers[:depth]:
                 layer.requires_grad_(True)
         else:
             raise ValueError("Unknown training phase: " + phase)
-        if model.shared_weight is not None:
+        if getattr(model, "shared_weight", None) is not None:
             model.shared_weight.requires_grad_(phase != "new_layer" or depth == 1)
     return {name: p for name, p in model.named_parameters() if p.requires_grad}
 
@@ -160,6 +184,10 @@ def _fit(data, method, mode, config, device, dest, fingerprint):
     level, = data.levels
     plan = stages(mode, config, method)
     is_na = method == "NA-ALISTA"
+    paired_online = config.get("paired_author_online", False) and method in ("NA-ALISTA", "SALISTA")
+    bounds = config.get("salista", {}).get("bounds", {})
+    if paired_online and method == "SALISTA" and bounds.get("mode") != "online_gaussian":
+        raise ValueError("Paired online SALISTA requires online_gaussian bounds")
     author_schedule = is_na and config.get("na_schedule") == "author"
     patience = None if author_schedule else config["early_stopping_patience"]
     decay = config.get("older_layer_gradient_decay", 0.3)
@@ -168,18 +196,22 @@ def _fit(data, method, mode, config, device, dest, fingerprint):
     np.random.seed(config["seed"])
     torch.manual_seed(config["seed"])
     signals = holdout = None
-    if is_na:
+    if is_na or paired_online:
         batch = 512 if author_schedule else config.get("na_batch_size", 512)
         train_size = 50000 if author_schedule else config.get("na_samples_per_epoch", 50000)
         if not 2 <= batch <= train_size:
-            raise ValueError("NA-ALISTA needs at least one complete training batch of size >= 2")
-        signals = sparse_signals(train_size, data.A.shape[1], data.config["nonzeros"])
+            raise ValueError("Online training needs at least one complete training batch of size >= 2")
+        if not paired_online:
+            signals = sparse_signals(train_size, data.A.shape[1], data.config["nonzeros"])
         if author_schedule:
             holdout = sparse_signals(10000, data.A.shape[1], data.config["nonzeros"])
-    model = build_model(method, data, depth).to(device)
+    model = build_model(method, data, depth, config).to(device)
+    shared_controller = is_na or (isinstance(model, SALISTA) and model.sharing == "shared")
+    tf_layerwise_loss = mode == "layerwise" and method not in ("NA-ALISTA", "SALISTA")
     dest.parent.mkdir(parents=True, exist_ok=True)
     global_epoch, total_updates = 0, 0
     stage_records = []
+    started = perf_counter()
     with TemporaryDirectory(dir=dest.parent) as temp:
         work = Path(temp) / "run"
         work.mkdir()
@@ -187,7 +219,7 @@ def _fit(data, method, mode, config, device, dest, fingerprint):
             for phase in plan:
                 params = trainable_parameters(model, phase.name, phase.depth)
                 optimizer = torch.optim.Adam(params.values(), lr=phase.lr)
-                multipliers = gradient_factors(params, phase, decay)
+                multipliers = [] if shared_controller else gradient_factors(params, phase, decay)
                 # Keep the incoming same-depth checkpoint eligible across fine-tuning phases.
                 best_score = stage_records[-1]["best_val_nmse"] if phase.name.startswith("joint_") else math.inf
                 best_epoch = stage_records[-1]["best_epoch"] if phase.name.startswith("joint_") else global_epoch
@@ -195,7 +227,10 @@ def _fit(data, method, mode, config, device, dest, fingerprint):
                 wait, stop_reason = 0, "epoch_limit"
                 for stage_epoch in range(1, phase.epochs + 1):
                     model.train()
-                    if is_na:
+                    if paired_online:
+                        batches = paired_author_batches(train_size, data.config["nonzeros"], model.A, level,
+                                                        batch, config["seed"] + global_epoch)
+                    elif is_na:
                         if global_epoch:
                             signals = sparse_signals(train_size, data.A.shape[1], data.config["nonzeros"])
                         batches = author_batches(signals, model.A, level, batch, shuffle=True)
@@ -208,13 +243,14 @@ def _fit(data, method, mode, config, device, dest, fingerprint):
                         pred = model(y, phase.depth, last_step_grad=(phase.name == "new_layer"))
                         squared_error = (pred - x).square()
                         # The TF layerwise references minimize tf.nn.l2_loss.
-                        loss = 0.5 * squared_error.sum() if mode == "layerwise" else squared_error.mean()
+                        loss = 0.5 * squared_error.sum() if tf_layerwise_loss else squared_error.mean()
                         if not torch.isfinite(loss):
                             raise FloatingPointError("Non-finite training loss")
                         loss.backward()
                         for parameter, factor in multipliers:
-                            parameter.grad.mul_(factor)
-                        max_norm = math.inf if mode == "layerwise" else 1.0
+                            if parameter.grad is not None:
+                                parameter.grad.mul_(factor)
+                        max_norm = math.inf if tf_layerwise_loss else 1.0
                         torch.nn.utils.clip_grad_norm_(params.values(), max_norm, error_if_nonfinite=True)
                         optimizer.step()
                         total_updates += 1
@@ -247,9 +283,18 @@ def _fit(data, method, mode, config, device, dest, fingerprint):
                                       "best_val_nmse": best_score, "trained_parameters": list(params)})
                 print(f"Depth {phase.depth} {phase.name}, epochs {stage_epoch}, {stop_reason}, "
                       f"best NMSE {best_score:.6g}", flush=True)
-        write_json(work / "run.json", {"experiment": identity, "device": str(device),
+        details = {}
+        if isinstance(model, SALISTA):
+            cert = model.certificate
+            details["salista_certificate"] = {
+                "initial_l1_bound": model.initial_l1_bound, "noise_l2_bound": model.noise_l2_bound,
+                "q_row": cert.q.max().item(), "gram_margin": cert.margin.item(), "mu": cert.mu.item(),
+                "sparsity_bound": cert.sparsity,
+                "parameters": sum(p.numel() for p in model.parameters())}
+        write_json(work / "run.json", {"experiment": identity, "device": str(device), **details,
                    "torch": torch.__version__, "epochs": global_epoch, "updates": total_updates,
-                   "training_data": "author_online" if is_na else "stored_single_snr",
+                   "training_data": "author_online" if is_na or paired_online else "stored_single_snr",
+                   "training_validation_seconds": perf_counter() - started,
                    "selection": "author_holdout" if author_schedule else "fixed_validation",
                    "batch_size": batch, "patience": patience, "stages": stage_records})
         work.rename(dest)
@@ -262,11 +307,11 @@ def load_checkpoint(data, path, device, fingerprint):
         raise ValueError("The dataset differs from the one used to train this checkpoint")
     signature = run.get("evaluation_sha256", LEGACY_EVALUATORS.get(run["implementation_sha256"]))
     # Earlier checkpoints use the same trained-weight forward equations.
-    if signature not in (implementation_sha256(EVALUATION_FILES),
-                         "e33783d3a46b7c21b13489d2ddc28847965e31e4967e524fa95eb716a3780fa7"):
+    known_baseline = run["method"] in BASELINE_METHODS and signature in BASELINE_EVALUATORS
+    if signature != implementation_sha256(EVALUATION_FILES) and not known_baseline:
         raise ValueError("Use the matching model and evaluation revision for this checkpoint")
     cfg = run["training"]
-    model = build_model(run["method"], data, cfg["depth"]).to(device)
+    model = build_model(run["method"], data, cfg["depth"], cfg).to(device)
     model.load_state_dict(torch.load(path / "best.pt", map_location=device, weights_only=True))
     return run, model.eval()
 
@@ -289,29 +334,32 @@ def test_run(data, path, device, fingerprint):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("train", "test"))
-    parser.add_argument("--model", choices=("all",) + METHODS, default="all")
+    parser.add_argument("--model", choices=("all",) + METHODS, default="all",
+                        help="'all' runs the published baseline grid; select SALISTA explicitly")
     parser.add_argument("--mode", choices=("both",) + MODES, default="both")
     parser.add_argument("--data", type=Path)
     parser.add_argument("--out", type=Path, default=DEFAULT_RUNS)
-    parser.add_argument("--config", type=Path, default=BASE / "training.json")
+    parser.add_argument("--config", type=Path)
     parser.add_argument("--seed", type=int, help="override the model initialization seed")
     parser.add_argument("--snr", type=float, required=True, choices=(40, 20, 10, 5, math.inf))
     parser.add_argument("--na-schedule", choices=("experiment", "author"),
                         help="author uses 100 + 20 * depth epochs and a separate synthetic holdout")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
-    cfg = json.loads(args.config.read_text(encoding="utf-8"))
+    config_path = args.config or BASE / ("training.salista.json" if args.model == "SALISTA" else "training.json")
+    cfg = json.loads(config_path.read_text(encoding="utf-8"))
     if args.seed is not None:
         cfg["seed"] = args.seed
     if args.na_schedule is not None:
         cfg["na_schedule"] = args.na_schedule
-    models = METHODS if args.model == "all" else (args.model,)
+    default_methods = METHODS if cfg.get("paired_author_online") and "salista" in cfg else BASELINE_METHODS
+    models = default_methods if args.model == "all" else (args.model,)
     modes = MODES if args.mode == "both" else (args.mode,)
     if not (type(cfg["depth"]) is int and cfg["depth"] >= 1 and cfg["batch_size"] >= 1
             and math.isfinite(cfg["learning_rate"]) and cfg["learning_rate"] > 0
             and 0 <= cfg["seed"] < 2**32):
         parser.error("Invalid training configuration")
-    jobs = [(m, mode) for m in models for mode in modes if mode in supported_modes(m)]
+    jobs = [(m, mode) for m in models for mode in modes if mode in supported_modes(m, cfg.get("na_shared_prefix", False))]
     if args.action == "test" and args.model == "NA-ALISTA" and args.mode == "layerwise":
         jobs = [(args.model, args.mode)]  # Evaluation of a historical checkpoint.
     if not jobs:

@@ -31,16 +31,28 @@ def validate(config):
         raise ValueError("SNR levels must be distinct")
 
 
+def analytic_weights(A):
+    """Offline Frobenius ALISTA solution for an existing full-row-rank dictionary."""
+    if (A.ndim != 2 or not 0 < A.shape[0] <= A.shape[1]
+            or A.dtype not in (np.float32, np.float64) or not np.isfinite(A).all()):
+        raise ValueError("Expected a finite float32/float64 dictionary with rows <= columns")
+    a64 = A.astype(np.float64)
+    try:
+        v = np.linalg.solve(a64 @ a64.T, a64)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("Analytic weights require a full-row-rank dictionary") from exc
+    diagonal = np.sum(a64 * v, axis=0)
+    if not np.isfinite(diagonal).all() or (diagonal <= 0).any():
+        raise ValueError("Analytic weights require nonzero dictionary columns")
+    return (v / diagonal).astype(A.dtype)
+
+
 def make_dictionary(m, n, seed):
     rng = np.random.default_rng(seed)
     A = rng.standard_normal((m, n))
     A /= np.linalg.norm(A, axis=0)
     A = A.astype(np.float32)
-    # Solve the constrained Frobenius problem for the actual saved dictionary.
-    a64 = A.astype(np.float64)
-    v = np.linalg.solve(a64 @ a64.T, a64)
-    W = v / np.sum(a64 * v, axis=0)
-    return A, W.astype(np.float32)
+    return A, analytic_weights(A)
 
 
 def save_split(root, size, A, k, levels, seed):

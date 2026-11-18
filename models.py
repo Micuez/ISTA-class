@@ -1,12 +1,18 @@
 """Unrolled sparse recovery models. Observation batches are row-major."""
 
+import math
+
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from generate import analytic_weights
+from salista_constraints import RecoveryCertificate, project_threshold_budget, rescale_stalled_threshold, recovery_prior
 
-METHODS = ("EBT-LISTA", "HLISTA", "ALISTA", "ELISTA", "NA-ALISTA")
+
+BASELINE_METHODS = ("EBT-LISTA", "HLISTA", "ALISTA", "ELISTA", "NA-ALISTA")
+METHODS = BASELINE_METHODS + ("SALISTA",)
 
 
 def scalar(value):
@@ -202,10 +208,141 @@ class NeuralALISTA(nn.Module):
         return path if return_path else x
 
 
-def build_model(method, data, depth):
+class CoordinateController(nn.Module):
+    """One recurrent state per sample, one set of head weights across coordinates."""
+
+    def __init__(self, cell, width, with_momentum):
+        super().__init__()
+        self.cell = (nn.GRUCell if cell == "gru" else nn.LSTMCell)(5, width)
+        self.context = nn.Linear(width, width)
+        self.local = nn.Linear(6, width, bias=False)
+        self.step = nn.Linear(width, 1)
+        self.momentum = nn.Linear(width, 1) if with_momentum else None
+        self.threshold = nn.Linear(width + 1, 1)
+
+    def forward(self, global_features, local_features, state):
+        state = self.cell(global_features.log1p(), state)
+        hidden = state[0] if isinstance(state, tuple) else state
+        features = (self.context(hidden).unsqueeze(1) + self.local(local_features)).tanh()
+        return features, state
+
+
+class SALISTA(nn.Module):
+    """V3 unroll with fixed [m,n] A/W and row-major [batch,m] observations."""
+
+    def __init__(self, A, W, sparsity, depth, *, initial_l1_bound, noise_l2_bound,
+                 cell="gru", sharing="shared", hidden_size=32, gamma_min=0.5,
+                 gamma_max=1.1, beta_max=0.2, eta=0.05, stall_threshold_ratio=None):
+        super().__init__()
+        if A.ndim != 2 or min(A.shape) < 1 or A.dtype not in (torch.float32, torch.float64):
+            raise ValueError("A must be a real float32/float64 [m,n] tensor")
+        if W is None:
+            W = torch.from_numpy(analytic_weights(A.detach().cpu().numpy())).to(A)
+        if A.shape != W.shape or A.device != W.device or A.dtype != W.dtype:
+            raise ValueError("Supplied W must match A in shape, dtype and device")
+        if type(depth) is not int or depth < 1 or type(hidden_size) is not int or hidden_size < 1:
+            raise ValueError("depth and hidden_size must be positive integers")
+        if cell not in ("gru", "lstm") or sharing not in ("shared", "untied"):
+            raise ValueError("Choose cell gru/lstm and sharing shared/untied")
+        if stall_threshold_ratio is not None and (type(stall_threshold_ratio) not in (int, float)
+                                                 or not 0 < stall_threshold_ratio < 1):
+            raise ValueError("stall_threshold_ratio must be null or in (0, 1)")
+        controls = (initial_l1_bound, noise_l2_bound, gamma_min, gamma_max, beta_max, eta)
+        if (not all(type(v) in (float, int) and math.isfinite(v) for v in controls)
+                or min(initial_l1_bound, noise_l2_bound, beta_max, eta) < 0
+                or not 0 < gamma_min <= gamma_max):
+            raise ValueError("Require finite nonnegative radii/caps and 0 < gamma_min <= gamma_max")
+        self.register_buffer("A", A.detach().clone())
+        self.register_buffer("W", W.detach().clone())
+        self.certificate = RecoveryCertificate(self.A, self.W, sparsity)
+        self.initial_l1_bound, self.noise_l2_bound = initial_l1_bound, noise_l2_bound
+        self.gamma_min, self.gamma_max = gamma_min, gamma_max
+        self.beta_max, self.eta = beta_max, eta
+        self.stall_threshold_ratio = stall_threshold_ratio
+        self.depth, self.sharing = depth, sharing
+        blocks = 1 if sharing == "shared" else depth
+        self.layers = nn.ModuleList(CoordinateController(cell, hidden_size, sharing == "shared" or i > 0)
+                                    for i in range(blocks)).to(self.A)
+
+    def stage_module(self, depth):
+        return self.layers[0 if self.sharing == "shared" else depth - 1]
+
+    def forward(self, y, depth, last_step_grad=False, return_path=False, *, return_diagnostics=False):
+        if type(depth) is not int or not 1 <= depth <= self.depth:
+            raise ValueError("Requested depth is outside the configured SALISTA unroll")
+        if y.ndim != 2 or y.shape[1] != self.A.shape[0]:
+            raise ValueError("Expected observations shaped [batch,m]")
+        cert = self.certificate
+        gram_available = bool(cert.margin > 0)
+        x = y.new_zeros((len(y), self.A.shape[1]))
+        previous_x = x
+        budget = y.new_full((len(y), 1), self.initial_l1_bound)
+        previous_budget = budget
+        support_certified = torch.ones_like(budget, dtype=torch.bool)
+        state = None  # The cell initializes zeros for each new observation batch.
+        path, diagnostics = [], []
+        for i in range(depth):
+            with torch.set_grad_enabled(torch.is_grad_enabled() and (not last_step_grad or i == depth - 1)):
+                r = y - x @ self.A.T
+                c = r @ self.W
+                change = x - previous_x
+                error, interference = cert.coordinate_bounds(c, budget, self.noise_l2_bound, gram_available)
+                if self.stall_threshold_ratio is not None and gram_available:
+                    # After a relaxation the error support may exceed s. Use only l1-based bounds.
+                    error = torch.where(support_certified, error, budget)
+                    interference = torch.where(support_certified, interference, cert.fallback_factor * budget)
+                global_features = torch.stack((r.abs().sum(1), c.abs().sum(1), c.abs().amax(1),
+                                               change.abs().sum(1), budget[:, 0]), dim=1)
+                local_features = torch.stack((x, c, change, error.log1p(), cert.q.expand_as(x),
+                                              cert.omega.expand_as(x)), dim=2)
+                block = self.stage_module(i + 1)
+                features, state = block(global_features, local_features, state)
+                step_fraction = block.step(features).squeeze(-1).sigmoid()
+                gamma = self.gamma_min + (self.gamma_max - self.gamma_min) * step_fraction
+                beta = self.beta_max * block.momentum(features).squeeze(-1).sigmoid() if i else torch.zeros_like(x)
+                lower = gamma * (interference + self.noise_l2_bound * cert.omega)
+                threshold_features = torch.cat((features, lower.log1p().unsqueeze(-1)), dim=2)
+                proposal = F.softplus(block.threshold(threshold_features).squeeze(-1))
+                delta = project_threshold_budget(proposal, self.eta * budget)
+                reference_theta = lower + delta
+                z = x + gamma * c + beta * change
+                if self.stall_threshold_ratio is None:
+                    theta = reference_theta
+                    scale = torch.ones_like(budget)
+                else:
+                    theta, scale, stalled = rescale_stalled_threshold(z, reference_theta, self.stall_threshold_ratio)
+                    support_certified = support_certified & ~stalled
+                next_x = shrink(z, theta)
+                if i + 1 < depth or return_diagnostics:
+                    triangle = self.initial_l1_bound + next_x.abs().sum(1, keepdim=True)
+                    next_budget = triangle
+                    if self.stall_threshold_ratio is None or support_certified.any():
+                        recurrence = cert.next_budget(gamma, budget, previous_budget, self.noise_l2_bound,
+                                                      self.eta, self.beta_max)
+                        next_budget = torch.where(support_certified, torch.minimum(recurrence, triangle), triangle)
+                    if return_diagnostics:
+                        diagnostics.append(dict(gamma=gamma, beta=beta, theta=theta, lower=lower, delta=delta,
+                                                error_bound=error, budget=budget, next_budget=next_budget,
+                                                reference_theta=reference_theta, threshold_scale=scale,
+                                                support_certified=support_certified))
+                    previous_budget, budget = budget, next_budget
+                previous_x, x = x, next_x
+            if return_path:
+                path.append(x)
+        result = path if return_path else x
+        return (result, diagnostics) if return_diagnostics else result
+
+
+def build_model(method, data, depth, config=None):
     if method not in METHODS or depth < 1:
         raise ValueError("Unknown method or invalid depth")
     A, W = torch.tensor(data.A), torch.tensor(data.W)
+    if method == "SALISTA":
+        config = config or {}
+        options = dict(config.get("salista", {}))
+        s = data.config["nonzeros"]
+        s, b0, epsilon = recovery_prior(options.pop("bounds", None), A, s, config.get("snr_db"))
+        return SALISTA(A, W, s, depth, initial_l1_bound=b0, noise_l2_bound=epsilon, **options)
     if method == "NA-ALISTA":
         return NeuralALISTA(A, W, data.config["nonzeros"], depth)
     return UnfoldedISTA(method, A, W, depth)

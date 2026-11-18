@@ -15,14 +15,14 @@ import torch
 from dataset import RecoveryData, level_key
 from evaluation import tensors
 from generate import sha256
-from models import METHODS
+from models import BASELINE_METHODS, METHODS
 from train import DEFAULT_RUNS, MODES, load_checkpoint, matched_level, supported_modes
 from verify_data import check_paired_signals
 
 
 SNRS = (40, 20, 10, 5, float("inf"))
 COLORS = {"EBT-LISTA": "#0072B2", "HLISTA": "#D98600", "ALISTA": "#008364",
-          "ELISTA": "#7656A4", "NA-ALISTA": "#C45112"}
+          "ELISTA": "#7656A4", "NA-ALISTA": "#C45112", "SALISTA": "#394D67"}
 
 
 @torch.inference_mode()
@@ -134,10 +134,10 @@ def main():
     parser.add_argument("--data-main", type=Path, default=Path("data/main"))
     parser.add_argument("--data-noiseless", type=Path, default=Path("data/noiseless"))
     parser.add_argument("--snrs", type=float, nargs="+", default=SNRS, choices=SNRS)
-    parser.add_argument("--methods", nargs="+", choices=METHODS, default=METHODS)
+    parser.add_argument("--methods", nargs="+", choices=METHODS, default=BASELINE_METHODS)
     parser.add_argument("--modes", nargs="+", choices=MODES, default=("layerwise", "end_to_end"))
-    parser.add_argument("--include-legacy-na", action="store_true",
-                        help="also read the truncated-gradient NA-ALISTA runs from the previous grid")
+    parser.add_argument("--include-na-prefix", "--include-legacy-na", dest="include_na_layerwise", action="store_true",
+                        help="also read the NA-ALISTA layerwise checkpoints from this run directory")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--split", choices=("val", "test"), default="val")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
@@ -159,7 +159,7 @@ def main():
         level = matched_level(data, snr)
         for method in args.methods:
             for mode in args.modes:
-                if mode not in supported_modes(method) and not args.include_legacy_na:
+                if mode not in supported_modes(method, args.include_na_layerwise):
                     continue
                 path = args.runs / method / mode / ("snr-" + key) / f"seed-{args.seed}"
                 run, model = load_checkpoint(data, path, device, fingerprint)

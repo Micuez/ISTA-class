@@ -11,7 +11,7 @@ import torch
 from dataset import RecoveryData
 from experiment_inputs import column_batches, torch_batches
 from generate import generate, generate_noiseless
-from models import METHODS, NeuralALISTA, build_model, multistage_threshold
+from models import BASELINE_METHODS, NeuralALISTA, build_model, multistage_threshold
 from na_training import author_batches
 from plot_single_snr import fixed_depth_metrics
 from run_single_snr_grid import grid_jobs
@@ -96,7 +96,7 @@ class ExperimentTests(unittest.TestCase):
     def test_batch_independence_and_layer_freezing(self):
         y, x = next(self.data.batches("train", 8))
         y, x = torch.from_numpy(y), torch.from_numpy(x)
-        for method in METHODS:
+        for method in BASELINE_METHODS:
             with self.subTest(method=method):
                 model = build_model(method, self.data, 2)
                 if isinstance(model, NeuralALISTA):
@@ -119,7 +119,7 @@ class ExperimentTests(unittest.TestCase):
         cfg = dict(depth=2, max_epochs_per_layer=3, max_epochs_end_to_end=2,
                    early_stopping_patience=50, batch_size=8, learning_rate=0.001, seed=3,
                    snr_db=5, na_batch_size=4, na_samples_per_epoch=12)
-        for method in METHODS:
+        for method in BASELINE_METHODS:
             for mode in supported_modes(method):
                 with self.subTest(method=method, mode=mode):
                     dest = self.root / method / mode

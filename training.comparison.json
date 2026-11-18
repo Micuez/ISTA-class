@@ -1,0 +1,29 @@
+{
+  "depth": 16,
+  "max_epochs_per_layer": 1000,
+  "max_epochs_end_to_end": 100000,
+  "early_stopping_patience": 50,
+  "batch_size": 64,
+  "learning_rate": 0.001,
+  "layerwise_learning_rate": 0.0005,
+  "finetune_lr_factors": [0.2, 0.02],
+  "older_layer_gradient_decay": 0.3,
+  "seed": 20261118,
+  "na_schedule": "experiment",
+  "na_shared_prefix": true,
+  "paired_author_online": true,
+  "na_batch_size": 512,
+  "na_samples_per_epoch": 50000,
+  "recurrent_learning_rate": 0.0002,
+  "salista": {
+    "cell": "gru",
+    "sharing": "shared",
+    "hidden_size": 32,
+    "gamma_min": 0.5,
+    "gamma_max": 1.1,
+    "beta_max": 0.2,
+    "eta": 0.05,
+    "stall_threshold_ratio": 0.8,
+    "bounds": {"mode": "online_gaussian", "failure_probability": 0.01}
+  }
+}
