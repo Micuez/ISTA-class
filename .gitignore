@@ -1,6 +1,7 @@
 /data/
 /upstream/
 /runs/
+/fonts/
 __pycache__/
 *.pyc
 .venv/

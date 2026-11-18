@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 import numpy as np
 import torch
 
-from dataset import RecoveryData
+from dataset import RecoveryData, level_key
 from evaluation import evaluate, tensors
 from models import METHODS, NeuralALISTA, build_model
 
@@ -62,6 +62,27 @@ def stages(mode, config):
     return [(i, base + int(i > depth - extra)) for i in range(1, depth + 1)]
 
 
+def matched_level(data, snr_db):
+    for level in data.levels:
+        if float(level) == float(snr_db):
+            return level
+    raise ValueError("Unknown noise level: " + str(snr_db))
+
+
+def single_level(data, config):
+    """Return the previous level tuple after restricting training to config['snr_db']."""
+    if "snr_db" not in config:
+        return None
+    previous = data.levels
+    data.levels = (matched_level(data, config["snr_db"]),)
+    return previous
+
+
+def restore_levels(data, previous):
+    if previous is not None:
+        data.levels = previous
+
+
 def trainable_parameters(model, mode, depth):
     model.requires_grad_(mode == "end_to_end")
     if mode == "layerwise":
@@ -74,6 +95,14 @@ def trainable_parameters(model, mode, depth):
 
 
 def fit(data, method, mode, config, device, dest, fingerprint):
+    previous_levels = single_level(data, config)
+    try:
+        _fit(data, method, mode, config, device, dest, fingerprint)
+    finally:
+        restore_levels(data, previous_levels)
+
+
+def _fit(data, method, mode, config, device, dest, fingerprint):
     identity = {"method": method, "mode": mode, "training": config,
                 "data_manifest_sha256": fingerprint, "implementation_sha256": implementation_sha256(),
                 "evaluation_sha256": implementation_sha256(EVALUATION_FILES)}
@@ -138,6 +167,8 @@ def fit(data, method, mode, config, device, dest, fingerprint):
                                       "updates": total_updates - start_updates, "stop_reason": stop_reason,
                                       "best_epoch": best_epoch, "best_val_nmse": best_score,
                                       "trained_parameters": list(params)})
+                print("Stage depth={} epochs={} stop={} best_val_nmse={:.6g}".format(
+                    active_depth, stage_epoch, stop_reason, best_score), flush=True)
         write_json(work / "run.json", {"experiment": identity, "device": str(device),
                    "torch": str(torch.__version__), "epochs": global_epoch,
                    "updates": total_updates, "stages": stage_records})
@@ -153,9 +184,13 @@ def test_run(data, path, device, fingerprint):
     if signature != implementation_sha256(EVALUATION_FILES):
         raise ValueError("Use the matching model and evaluation revision for this checkpoint")
     cfg = run["training"]
-    model = build_model(run["method"], data, cfg["depth"]).to(device)
-    model.load_state_dict(torch.load(path / "best.pt", map_location=device, weights_only=True))
-    scores, _ = evaluate(model, data, "test", cfg["depth"], cfg["batch_size"], device)
+    previous_levels = single_level(data, cfg)
+    try:
+        model = build_model(run["method"], data, cfg["depth"]).to(device)
+        model.load_state_dict(torch.load(path / "best.pt", map_location=device, weights_only=True))
+        scores, _ = evaluate(model, data, "test", cfg["depth"], cfg["batch_size"], device)
+    finally:
+        restore_levels(data, previous_levels)
     with TemporaryDirectory(dir=path) as tmp:
         result = Path(tmp) / "test.json"
         write_json(result, {"method": run["method"], "mode": run["mode"], "snr_db": scores})
@@ -172,6 +207,7 @@ def main():
     parser.add_argument("--out", type=Path, default=Path("runs/v1"))
     parser.add_argument("--config", type=Path, default=BASE / "training.json")
     parser.add_argument("--seed", type=int, help="override the model initialization seed")
+    parser.add_argument("--snr", type=float, help="train and score one noise level in dB")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
     cfg = json.loads(args.config.read_text(encoding="utf-8"))
@@ -193,10 +229,15 @@ def main():
     torch.use_deterministic_algorithms(True)
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
     data = RecoveryData(args.data)
+    if args.snr is not None:
+        cfg["snr_db"] = matched_level(data, args.snr)
     fingerprint = hashlib.sha256((args.data / "manifest.json").read_bytes()).hexdigest()
     for method in models:
         for mode in modes:
-            dest = args.out / method / mode / ("seed-" + str(cfg["seed"]))
+            dest = args.out / method / mode
+            if "snr_db" in cfg:
+                dest = dest / ("snr-" + level_key(cfg["snr_db"]))
+            dest = dest / ("seed-" + str(cfg["seed"]))
             if args.action == "train":
                 fit(data, method, mode, cfg, device, dest, fingerprint)
             else:
