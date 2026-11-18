@@ -1,4 +1,4 @@
-"""PyTorch implementations of the four pinned sparse-recovery variants."""
+"""Unrolled sparse recovery models. Observation batches are row-major."""
 
 import numpy as np
 import torch
@@ -6,7 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 
 
-METHODS = ("EBT-LISTA", "HLISTA", "ALISTA", "NA-ALISTA")
+METHODS = ("EBT-LISTA", "HLISTA", "ALISTA", "ELISTA", "NA-ALISTA")
 
 
 def scalar(value):
@@ -34,6 +34,31 @@ class AnalyticLayer(nn.Module):
     def forward(self, x, y, A, W):
         direction = (y - x @ A.T) @ W
         return shrink_ss(x + self.alpha * direction, self.theta, self.rank)
+
+
+def multistage_threshold(z, first, second):
+    # Li et al., Eq. (6). Keep the two breakpoints ordered during optimization.
+    a, b = first.abs(), second.abs()
+    lo, hi = torch.minimum(a, b), torch.maximum(a, b)
+    width = hi - lo
+    safe_width = torch.where(width > 0, width, torch.ones_like(width))
+    middle = z.sign() * hi * ((z.abs() - lo) / safe_width).clamp(0, 1)
+    return torch.where(z.abs() >= hi, z, middle)
+
+
+class ExtragradientLayer(nn.Module):
+    def __init__(self, threshold):
+        super().__init__()
+        self.alpha1, self.alpha2 = scalar(1), scalar(1)
+        self.theta1, self.upper1 = scalar(threshold - 0.1), scalar(threshold)
+        self.theta2, self.upper2 = scalar(threshold - 0.1), scalar(threshold)
+
+    def forward(self, x, y, A, W):
+        mid = multistage_threshold(x + self.alpha1 * ((y - x @ A.T) @ W),
+                                   self.theta1, self.upper1)
+        # The second residual is evaluated at mid, but the update starts at x.
+        return multistage_threshold(x + self.alpha2 * ((y - mid @ A.T) @ W),
+                                    self.theta2, self.upper2)
 
 
 class ErrorThresholdLayer(nn.Module):
@@ -84,12 +109,15 @@ class UnfoldedISTA(nn.Module):
         self.register_buffer("A", A)
         self.register_buffer("W", W)
         scale = 1.001 * torch.linalg.matrix_norm(A, ord=2).item() ** 2
+        self.shared_weight = nn.Parameter(A.clone() / scale) if method == "ELISTA" else None
         self.layers = nn.ModuleList()
         for t in range(1, depth + 1):
             percent = min(t * (0.7 if method == "HLISTA" else 1.2), 13)
             rank = round((A.shape[1] - 1) * percent / 100)
             if method == "ALISTA":
                 layer = AnalyticLayer(0.4 / scale, rank)
+            elif method == "ELISTA":
+                layer = ExtragradientLayer(0.4 / scale)
             elif method == "HLISTA":
                 layer = HybridLayer(A / scale, 0.4 / scale, rank)
             else:
@@ -99,13 +127,17 @@ class UnfoldedISTA(nn.Module):
     def stage_module(self, depth):
         return self.layers[depth - 1]
 
-    def forward(self, y, depth, last_step_grad=False):
+    def forward(self, y, depth, last_step_grad=False, return_path=False):
         x = y.new_zeros((len(y), self.A.shape[1]))
+        path = []
+        weight = self.W if self.shared_weight is None else self.shared_weight
         for i in range(depth):
             with torch.set_grad_enabled(torch.is_grad_enabled() and
                                         (not last_step_grad or i == depth - 1)):
-                x = self.layers[i](x, y, self.A, self.W)
-        return x
+                x = self.layers[i](x, y, self.A, weight)
+            if return_path:
+                path.append(x)
+        return path if return_path else x
 
 
 class NormController(nn.Module):
@@ -114,8 +146,8 @@ class NormController(nn.Module):
         self.lstm = nn.LSTMCell(2, 128)
         self.lll = nn.Linear(128, 128)
         self.linear = nn.Linear(128, 2)
-        self.hidden = nn.Parameter(torch.randn(128))
-        self.cellstate = nn.Parameter(torch.randn(128))
+        self.hidden = nn.Parameter(torch.tensor(np.random.normal(size=128), dtype=torch.float32))
+        self.cellstate = nn.Parameter(torch.tensor(np.random.normal(size=128), dtype=torch.float32))
 
     def forward(self, features, state):
         hidden, cell = self.lstm(features, state)
@@ -148,8 +180,9 @@ class NeuralALISTA(nn.Module):
         self.mean.copy_(features.mean(0))
         self.std.copy_(features.std(0).clamp_min(torch.finfo(train_y.dtype).eps))
 
-    def forward(self, y, depth, last_step_grad=False):
+    def forward(self, y, depth, last_step_grad=False, return_path=False):
         x = y.new_zeros((len(y), self.A.shape[1]))
+        path = []
         state = (self.regressor.hidden.expand(len(y), -1), self.regressor.cellstate.expand(len(y), -1))
         for i in range(depth):
             with torch.set_grad_enabled(torch.is_grad_enabled() and
@@ -164,7 +197,9 @@ class NeuralALISTA(nn.Module):
                 if count:
                     cutoff = z.detach().abs().topk(count, dim=1).values[:, -1:]
                     x = torch.where(z.abs() > cutoff, z, x)
-        return x
+            if return_path:
+                path.append(x)
+        return path if return_path else x
 
 
 def build_model(method, data, depth):

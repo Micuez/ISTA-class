@@ -10,10 +10,13 @@ import torch
 
 from dataset import RecoveryData
 from experiment_inputs import column_batches, torch_batches
-from generate import generate
-from models import METHODS, NeuralALISTA, build_model
-from train import evaluate, fit, stages, test_run, trainable_parameters
-from verify_data import verify
+from generate import generate, generate_noiseless
+from models import METHODS, NeuralALISTA, build_model, multistage_threshold
+from na_training import author_batches
+from plot_single_snr import fixed_depth_metrics
+from run_single_snr_grid import grid_jobs
+from train import evaluate, fit, load_checkpoint, stages, supported_modes, tensors, test_run, trainable_parameters
+from verify_data import check_paired_signals, verify
 
 
 class ExperimentTests(unittest.TestCase):
@@ -100,10 +103,11 @@ class ExperimentTests(unittest.TestCase):
                     model.calibrate(y)
                 torch.testing.assert_close(model(y, 2), torch.cat([model(v[None], 2) for v in y]),
                                            rtol=4e-5, atol=3e-6)
-                params = trainable_parameters(model, "layerwise", 2)
+                new_only = method != "NA-ALISTA"
+                params = trainable_parameters(model, "new_layer" if new_only else "end_to_end", 2)
                 before = {name: p.detach().clone() for name, p in model.named_parameters()}
                 optimizer = torch.optim.Adam(params.values(), lr=0.002)
-                (model(y, 2, last_step_grad=True) - x).square().mean().backward()
+                (model(y, 2, last_step_grad=new_only) - x).square().mean().backward()
                 optimizer.step()
                 for name, param in model.named_parameters():
                     if name not in params:
@@ -112,23 +116,26 @@ class ExperimentTests(unittest.TestCase):
                 self.assertTrue(any(not torch.equal(p, before[n]) for n, p in params.items()))
 
     def test_both_training_modes_and_checkpoint_evaluation(self):
-        cfg = dict(depth=2, total_epochs=2, batch_size=8, learning_rate=0.001, seed=3)
+        cfg = dict(depth=2, max_epochs_per_layer=3, max_epochs_end_to_end=2,
+                   early_stopping_patience=50, batch_size=8, learning_rate=0.001, seed=3,
+                   snr_db=5, na_batch_size=4, na_samples_per_epoch=12)
         for method in METHODS:
-            for mode in ("end_to_end", "layerwise"):
+            for mode in supported_modes(method):
                 with self.subTest(method=method, mode=mode):
                     dest = self.root / method / mode
                     fit(self.data, method, mode, cfg, "cpu", dest, "test-id")
-                    self.assertFalse((dest / "test.json").exists())
                     log = json.loads((dest / "run.json").read_text())
-                    self.assertEqual(log["updates"], 10)
-                    self.assertEqual(len(log["stages"]), 1 if mode == "end_to_end" else 2)
+                    expected = 12 if mode == "layerwise" else (6 if method == "NA-ALISTA" else 4)
+                    self.assertEqual(log["updates"], expected)
                     test_run(self.data, dest, "cpu", "test-id")
                     metrics = json.loads((dest / "test.json").read_text())["snr_db"]
-                    self.assertEqual(set(metrics), {"40", "20", "10", "5"})
-                    self.assertTrue(all(np.isfinite(m["nmse"]) and m["signals"] == 5
-                                        for m in metrics.values()))
+                    self.assertEqual(set(metrics), {"5"})
+                    run, model = load_checkpoint(self.data, dest, "cpu", "test-id")
+                    rows, _ = fixed_depth_metrics(model, self.data, 5, 2, 8, "cpu", "test")
+                    self.assertAlmostEqual(rows[-1]["nmse"], metrics["5"]["nmse"], places=11)
                     with self.assertRaisesRegex(ValueError, "dataset differs"):
                         test_run(self.data, dest, "cpu", "different-dataset")
+        self.assertEqual(tuple(self.data.levels), (40, 20, 10, 5))
 
     def test_score_is_global_energy_ratio(self):
         class Zero(torch.nn.Module):
@@ -138,63 +145,112 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(mean, 1.0)
         self.assertTrue(all(row["nmse_db"] == 0.0 for row in result.values()))
 
-    def test_formal_budget_is_per_stage(self):
+    def test_formal_budget_and_grid(self):
         config = json.loads(Path(__file__).with_name("training.json").read_text())
-        self.assertEqual(config["early_stopping_patience"], 5)
-        self.assertEqual(stages("end_to_end", config), [(16, 100000)])
-        self.assertEqual(stages("layerwise", config), [(i, 100000) for i in range(1, 17)])
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            stages("end_to_end", dict(config, total_epochs=1))
+        self.assertEqual(config["early_stopping_patience"], 50)
+        self.assertEqual(stages("end_to_end", config)[0].epochs, 100000)
+        phases = stages("layerwise", config)
+        self.assertEqual(len(phases), 48)
+        for d in range(1, 17):
+            group = [p for p in phases if p.depth == d]
+            self.assertEqual([p.name for p in group], ["new_layer", "joint_1", "joint_2"])
+            self.assertEqual([p.epochs for p in group], [334, 333, 333])
+            np.testing.assert_allclose([p.lr for p in group], [0.0005, 0.0001, 0.00001])
+        self.assertEqual(len(set(grid_jobs())), 45)
+        self.assertTrue(all(mode == "end_to_end" for m, mode, _ in grid_jobs() if m == "NA-ALISTA"))
+        self.assertEqual(stages("end_to_end", dict(config, na_schedule="author"), "NA-ALISTA")[0].epochs, 420)
+        with self.assertRaisesRegex(ValueError, "supports"):
+            stages("layerwise", config, "NA-ALISTA")
 
-    def test_patience_counts_consecutive_epochs_and_restores_best(self):
-        cfg = dict(depth=2, max_epochs_per_stage=12, early_stopping_patience=5,
-                   batch_size=8, learning_rate=0.001, seed=3)
-        # A tie counts as a miss. Epoch 3 resets the wait for end-to-end training.
-        scores = {"end_to_end": {2: [1, 1, 0.9, 0.9, 1.1, 1, 0.9, 1]},
-                  "layerwise": {1: [1] * 6, 2: [2, 1.9, 2, 1.9, 2, 2, 1.9]}}
-        for mode, traces in scores.items():
-            dest = self.root / "patience" / mode
-            seen = {depth: [] for depth in traces}
+    def test_fifty_misses_and_best_weights(self):
+        cfg = dict(depth=1, max_epochs_per_layer=3, max_epochs_end_to_end=60,
+                   early_stopping_patience=50, batch_size=8, learning_rate=0.001, seed=3, snr_db=5)
+        trace = iter([1.0, 1.0, 0.9] + [0.9, 1.0] * 25)
+        seen = []
+        def validation(model, data, split, depth, batch_size, device):
+            self.assertEqual(split, "val")
+            seen.append({k: v.detach().clone() for k, v in model.state_dict().items()})
+            return {}, next(trace)
+        out = self.root / "fifty"
+        with patch("train.evaluate", new=validation):
+            fit(self.data, "ALISTA", "end_to_end", cfg, "cpu", out, "id")
+        stage, = json.loads((out / "run.json").read_text())["stages"]
+        self.assertEqual((stage["epochs_run"], stage["best_epoch"], stage["stop_reason"]),
+                         (53, 3, "validation_patience"))
+        for name, value in torch.load(out / "best.pt", weights_only=True).items():
+            torch.testing.assert_close(value, seen[2][name], rtol=0, atol=0)
 
-            def validation(model, data, split, depth, batch_size, device):
-                self.assertEqual(split, "val")
-                index = len(seen[depth])
-                seen[depth].append({name: tensor.detach().clone()
-                                    for name, tensor in model.state_dict().items()})
-                return {}, traces[depth][index]
-
-            with self.subTest(mode=mode), patch("train.evaluate", new=validation):
-                fit(self.data, "ALISTA", mode, cfg, "cpu", dest, "early-stop-test")
-                run = json.loads((dest / "run.json").read_text())
-                self.assertEqual(run["epochs"], sum(map(len, traces.values())))
-                self.assertEqual(run["updates"], 5 * run["epochs"])
-                for record in run["stages"]:
-                    curve = traces[record["depth"]]
-                    first_best = curve.index(min(curve))
-                    self.assertEqual(record["stop_reason"], "validation_patience")
-                    self.assertEqual(record["epochs_run"], len(curve))
-                    self.assertEqual(record["best_epoch"], record["epochs"][0] + first_best)
-                best_idx = traces[2].index(min(traces[2]))
-                saved = torch.load(dest / "best.pt", weights_only=True)
-                for name, value in saved.items():
-                    torch.testing.assert_close(value, seen[2][best_idx][name], rtol=0, atol=0)
-                history = [json.loads(s) for s in (dest / "history.jsonl").read_text().splitlines()]
-                self.assertTrue(all(r["epochs_without_improvement"] == 0 for r in history
-                                    if r["stage_epoch"] == 1))
-                self.assertEqual(history[-1]["epochs_without_improvement"], 5)
-
-    def test_improving_validation_reaches_epoch_cap(self):
-        cfg = dict(depth=1, max_epochs_per_stage=3, early_stopping_patience=5,
-                   batch_size=8, learning_rate=0.001, seed=3)
-        dest = self.root / "cap"
-        scores = iter([1.0, 0.9, 0.8])
+    def test_joint_phases_keep_incoming_best_and_can_update_prefix(self):
+        cfg = dict(depth=1, max_epochs_per_layer=9, max_epochs_end_to_end=3, early_stopping_patience=2,
+                   batch_size=8, learning_rate=0.001, seed=3, snr_db=5)
+        scores = iter([0.9, 0.8, 0.7, 0.9, 0.9, 0.6, 0.7, 0.8])
+        out = self.root / "joint"
         with patch("train.evaluate", new=lambda *args: ({}, next(scores))):
-            fit(self.data, "ALISTA", "end_to_end", cfg, "cpu", dest, "cap-test")
-        record = json.loads((dest / "run.json").read_text())["stages"][0]
-        self.assertEqual((record["epochs_run"], record["best_epoch"], record["stop_reason"]),
-                         (3, 3, "epoch_limit"))
+            fit(self.data, "ALISTA", "layerwise", cfg, "cpu", out, "id")
+        records = json.loads((out / "run.json").read_text())["stages"]
+        self.assertEqual([s["epochs_run"] for s in records], [3, 2, 3])
+        self.assertEqual([s["best_epoch"] for s in records], [3, 3, 6])
+        self.assertEqual(records[0]["stop_reason"], "epoch_limit")
+        y, x = next(tensors(self.data, "train", 8, "cpu", level=5))
+        for method in ("ELISTA", "ALISTA", "EBT-LISTA", "HLISTA"):
+            net = build_model(method, self.data, 3)
+            params = trainable_parameters(net, "joint_1", 2)
+            self.assertTrue(any(n.startswith("layers.0.") for n in params))
+            self.assertFalse(any(n.startswith("layers.2.") for n in params))
+            self.assertEqual("shared_weight" in params, method == "ELISTA")
+            prefix_before = [p.detach().clone() for p in net.layers[0].parameters()]
+            opt = torch.optim.Adam(params.values(), lr=1e-4)
+            (net(y, 2) - x).square().mean().backward()
+            opt.step()
+            self.assertTrue(any(not torch.equal(p, v) for p, v in zip(net.layers[0].parameters(), prefix_before)))
 
-    def test_na_forward_matches_author_for_identical_weights(self):
+    def test_elista_equation8_with_tied_matrix_and_mt(self):
+        net = build_model("ELISTA", self.data, 3)
+        y, _ = next(self.data.batches("train", 8, 5))
+        w = net.shared_weight.detach().numpy()
+        self.assertEqual(sum(p.numel() for p in net.parameters()), w.size + 6 * 3)
+        x = np.zeros((len(y), w.shape[1]), dtype=np.float32)
+        def mt(z, a, b):
+            lo, hi = sorted([abs(a.item()), abs(b.item())])
+            return np.sign(z) * np.where(abs(z) <= lo, 0, np.where(
+                abs(z) >= hi, abs(z), hi * (abs(z) - lo) / (hi - lo)))
+        paths = net(torch.from_numpy(y), 3, return_path=True)
+        for i, block in enumerate(net.layers):
+            mid = mt(x + block.alpha1.item() * ((y - x @ self.data.A.T) @ w), block.theta1, block.upper1)
+            x = mt(x + block.alpha2.item() * ((y - mid @ self.data.A.T) @ w), block.theta2, block.upper2)
+            np.testing.assert_allclose(paths[i].detach().numpy(), x, atol=2e-6)
+        z = torch.tensor([-2., -1., -0.5, 0., .5, 1., 2.], requires_grad=True)
+        a, b = torch.tensor(1., requires_grad=True), torch.tensor(1., requires_grad=True)
+        value = multistage_threshold(z, a, b)
+        value.sum().backward()
+        self.assertTrue(all(torch.isfinite(v.grad).all() for v in (a, b, z)))
+
+    def test_noiseless_sibling_and_na_noise(self):
+        dest = self.root / "clean"
+        generate_noiseless(self.data.root, dest)
+        self.assertEqual(verify(dest)["val"]["inf"], "inf")
+        sibling = RecoveryData(dest)
+        check_paired_signals(self.data, sibling)
+        for name in ("A.npy", "W.npy", "train/x.npy", "val/x.npy", "test/x.npy"):
+            self.assertEqual(sibling.manifest["sha256"][name], self.manifest["sha256"][name])
+        sibling.manifest["sha256"]["test/x.npy"] = "other-signals"
+        with self.assertRaisesRegex(ValueError, "test/x.npy"):
+            check_paired_signals(self.data, sibling)
+        matrix = torch.tensor(self.data.A)
+        x = torch.tensor(np.array(self.data.arrays("train", 5)[1]))
+        y0, x0 = next(author_batches(x, matrix, "inf", 4, False))
+        torch.testing.assert_close(y0, x0 @ matrix.T)
+        torch.manual_seed(44)
+        actual, _ = next(author_batches(x, matrix, 5, 4, False))
+        torch.manual_seed(44)
+        original_batch = next(iter(torch.utils.data.DataLoader(x, batch_size=4, drop_last=True)))
+        original_y = original_batch @ matrix.T
+        std = original_y.std(dim=1, keepdim=True) * 10 ** (-5 / 20)
+        torch.testing.assert_close(actual, original_y + torch.normal(torch.zeros_like(original_y), std.expand_as(original_y)))
+        self.assertEqual(len(list(author_batches(x, matrix, "inf", 4, False))), 2)
+        self.assertEqual(list(author_batches(x[:2], matrix, 5, 4, False)), [])
+
+    def test_na_forward_and_adam_update_match_author(self):
         source = Path(__file__).parent / "upstream" / "NA-ALISTA"
         if not (source / "utils" / "algorithms.py").exists():
             self.skipTest("Optional author checkout is not prepared")
@@ -207,9 +263,20 @@ class ExperimentTests(unittest.TestCase):
         m, n = self.data.A.shape
         ref = NA_ALISTA(m, n, 3, self.data.A.copy(), self.data.W.copy(), 3, ours.counts).to(device)
         ours.regressor.load_state_dict(ref.regressor.state_dict())
-        y, _ = next(self.data.batches("train", 8))
-        y = torch.from_numpy(y).to(device)
+        y, x = (torch.from_numpy(v).to(device) for v in next(self.data.batches("train", 8)))
         ours.calibrate(y)
+        expected, _, _ = ref(y, None)
+        actual = ours(y, 3)
+        torch.testing.assert_close(actual, expected, rtol=4e-5, atol=3e-6)
+        for net, prediction in ((ours, actual), (ref, expected)):
+            optimizer = torch.optim.Adam(net.parameters(), lr=0.0002)
+            (prediction - x).square().mean().backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1)
+            optimizer.step()
+        for (our_name, ours_p), (ref_name, ref_p) in zip(
+                ours.regressor.named_parameters(), ref.regressor.named_parameters(), strict=True):
+            self.assertEqual(our_name, ref_name)
+            torch.testing.assert_close(ours_p.grad, ref_p.grad, rtol=5e-5, atol=1e-6)
         with torch.no_grad():
             expected, _, _ = ref(y, None)
             torch.testing.assert_close(ours(y, 3), expected, rtol=4e-5, atol=3e-6)

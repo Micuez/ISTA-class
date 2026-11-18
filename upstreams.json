@@ -17,6 +17,16 @@
     "code_dir": ".",
     "model": "ALISTA"
   },
+  "ELISTA": {
+    "url": "https://github.com/ZhengZY-EE/Hybrid_ISTA.git",
+    "commit": "ddde3c5867bfb453741d0c2e2cca507e6070994a",
+    "code_dir": ".",
+    "model": "ELISTA",
+    "source_file": "models/ELISTA.py",
+    "patch": "HLISTA",
+    "provenance": "Third-party TensorFlow implementation from the Hybrid ISTA authors",
+    "paper": "https://doi.org/10.1609/aaai.v35i10.17032"
+  },
   "NA-ALISTA": {
     "url": "https://github.com/feeds/na-alista.git",
     "commit": "40597f05e3ef179e4ae44173d25674640db7d27a",

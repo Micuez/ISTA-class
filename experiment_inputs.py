@@ -8,7 +8,16 @@ from dataset import RecoveryData
 
 
 def open_data():
-    return RecoveryData(os.environ["RECOVERY_DATA"])
+    data = RecoveryData(os.environ["RECOVERY_DATA"])
+    selected = os.environ.get("RECOVERY_SNR", os.environ.get("RECOVERY_TEST_DB"))
+    if selected is None and len(data.levels) == 1:
+        return data
+    if selected is not None:
+        for level in data.levels:
+            if float(level) == float(selected):
+                data.levels = (level,)
+                return data
+    raise ValueError("Set RECOVERY_SNR to a single SNR present in RECOVERY_DATA")
 
 
 def column_batches(data, split, batch_size, snr_db=None, epoch=0):
@@ -38,7 +47,8 @@ def tf_training_inputs(data, batch_size):
 def tf_test_inputs(data):
     import tensorflow as tf
 
-    y, x = data.arrays("test", float(os.environ["RECOVERY_TEST_DB"]))
+    level, = data.levels
+    y, x = data.arrays("test", level)
     return tf.constant(y.T), x.T
 
 

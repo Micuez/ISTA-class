@@ -1,7 +1,11 @@
 {
   "depth": 16,
-  "total_epochs": 32,
+  "max_epochs_per_layer": 3,
+  "max_epochs_end_to_end": 3,
+  "early_stopping_patience": 50,
   "batch_size": 64,
+  "na_batch_size": 64,
+  "na_samples_per_epoch": 256,
   "learning_rate": 0.001,
   "seed": 0
 }

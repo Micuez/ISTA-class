@@ -1,4 +1,4 @@
-"""Train or evaluate the four sparse recovery models with the same stored observations."""
+"""Train and evaluate one noise condition per checkpoint."""
 
 import argparse
 import hashlib
@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -14,10 +15,12 @@ import torch
 from dataset import RecoveryData, level_key
 from evaluation import evaluate, tensors
 from models import METHODS, NeuralALISTA, build_model
+from na_training import author_batches, author_holdout_score, sparse_signals
 
 
 BASE = Path(__file__).resolve().parent
 MODES = ("end_to_end", "layerwise")
+DEFAULT_RUNS = Path("runs/single-snr-finetuned")
 EVALUATION_FILES = ("dataset.py", "models.py", "evaluation.py")
 # The initial release recorded only a full trainer hash. Its prediction and
 # scoring routines are identical to the evaluation revision recorded here.
@@ -31,7 +34,7 @@ def write_json(path, obj):
     path.write_text(json.dumps(obj, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def implementation_sha256(files=EVALUATION_FILES + ("train.py",)):
+def implementation_sha256(files=EVALUATION_FILES + ("train.py", "na_training.py")):
     digest = hashlib.sha256()
     for name in files:
         digest.update(name.encode("ascii"))
@@ -39,27 +42,47 @@ def implementation_sha256(files=EVALUATION_FILES + ("train.py",)):
     return digest.hexdigest()
 
 
-def stages(mode, config):
+class Phase(NamedTuple):
+    depth: int
+    name: str
+    epochs: int
+    lr: float
+
+
+def supported_modes(method):
+    return ("end_to_end",) if method == "NA-ALISTA" else MODES
+
+
+def stages(mode, config, method="ALISTA"):
+    if mode not in supported_modes(method):
+        raise ValueError(f"{method} supports {', '.join(supported_modes(method))}")
     depth = config["depth"]
-    if ("total_epochs" in config) == ("max_epochs_per_stage" in config):
-        raise ValueError("Specify exactly one of total_epochs or max_epochs_per_stage")
-    patience = config.get("early_stopping_patience")
-    if patience is not None and (type(patience) is not int or patience < 1):
-        raise ValueError("early_stopping_patience must be a positive number of epochs")
-    stage_cap = config.get("max_epochs_per_stage")
-    epochs = config.get("total_epochs", stage_cap)
-    if type(epochs) is not int or epochs < 1:
-        raise ValueError("The epoch budget must be a positive integer")
+    patience = config["early_stopping_patience"]
+    if type(patience) is not int or patience < 1:
+        raise ValueError("early_stopping_patience must be a positive integer")
+    end_cap, layer_cap = config["max_epochs_end_to_end"], config["max_epochs_per_layer"]
+    if type(end_cap) is not int or end_cap < 1 or type(layer_cap) is not int or layer_cap < 3:
+        raise ValueError("Use a positive end-to-end budget and at least three epochs per layer")
+    if method == "NA-ALISTA":
+        schedule = config.get("na_schedule", "experiment")
+        if schedule not in ("experiment", "author"):
+            raise ValueError("Unknown NA-ALISTA schedule: " + str(schedule))
+        cap = 100 + 20 * depth if schedule == "author" else end_cap
+        return [Phase(depth, "end_to_end", cap, 0.0002)]
     if mode == "end_to_end":
-        return [(depth, epochs)]
-    if mode != "layerwise":
-        raise ValueError("Unknown training mode: " + str(mode))
-    if stage_cap is not None:
-        return [(i, stage_cap) for i in range(1, depth + 1)]
-    if epochs < depth:
-        raise ValueError("layerwise needs at least one epoch for each layer")
-    base, extra = divmod(epochs, depth)
-    return [(i, base + int(i > depth - extra)) for i in range(1, depth + 1)]
+        return [Phase(depth, mode, end_cap, config["learning_rate"])]
+    factors = config.get("finetune_lr_factors", [0.2, 0.02])
+    if len(factors) != 2 or not (0 < factors[1] < factors[0] < 1):
+        raise ValueError("Expect two decreasing fine-tuning LR factors between 0 and 1")
+    base = config.get("layerwise_learning_rate", 0.0005)
+    if not math.isfinite(base) or base <= 0:
+        raise ValueError("layerwise_learning_rate must be finite and positive")
+    quotient, remainder = divmod(layer_cap, 3)
+    plan = []
+    for active in range(1, depth + 1):
+        for i, (name, factor) in enumerate(zip(("new_layer", "joint_1", "joint_2"), (1, *factors))):
+            plan.append(Phase(active, name, quotient + int(i < remainder), base * factor))
+    return plan
 
 
 def matched_level(data, snr_db):
@@ -83,18 +106,38 @@ def restore_levels(data, previous):
         data.levels = previous
 
 
-def trainable_parameters(model, mode, depth):
-    model.requires_grad_(mode == "end_to_end")
-    if mode == "layerwise":
-        model.stage_module(depth).requires_grad_(True)
-        if isinstance(model, NeuralALISTA) and depth > 1:
-            # The detached prefix consumed the two learned initial states.
-            model.regressor.hidden.requires_grad_(False)
-            model.regressor.cellstate.requires_grad_(False)
+def trainable_parameters(model, phase, depth):
+    model.requires_grad_(phase == "end_to_end")
+    if phase != "end_to_end":
+        if isinstance(model, NeuralALISTA):
+            raise ValueError("NA-ALISTA requires full end-to-end backpropagation")
+        if phase == "new_layer":
+            model.stage_module(depth).requires_grad_(True)
+        elif phase in ("joint_1", "joint_2"):
+            for layer in model.layers[:depth]:
+                layer.requires_grad_(True)
+        else:
+            raise ValueError("Unknown training phase: " + phase)
+        if model.shared_weight is not None:
+            model.shared_weight.requires_grad_(phase != "new_layer" or depth == 1)
     return {name: p for name, p in model.named_parameters() if p.requires_grad}
 
 
+def gradient_factors(params, phase, decay):
+    # Match get_train_op in the TF references: multiply gradients before Adam.
+    if not phase.name.startswith("joint_"):
+        return []
+    factors = []
+    for name, parameter in params.items():
+        first_depth = 1 if name == "shared_weight" else int(name.split(".")[1]) + 1
+        factors.append((parameter, decay ** (phase.depth - first_depth)))
+    return factors
+
+
 def fit(data, method, mode, config, device, dest, fingerprint):
+    if "snr_db" not in config:
+        raise ValueError("A single snr_db is required for training")
+    stages(mode, config, method)
     previous_levels = single_level(data, config)
     try:
         _fit(data, method, mode, config, device, dest, fingerprint)
@@ -114,14 +157,26 @@ def _fit(data, method, mode, config, device, dest, fingerprint):
                 return
         raise FileExistsError("Use a new --out for changed settings: " + str(dest))
     depth, batch = config["depth"], config["batch_size"]
-    patience = config.get("early_stopping_patience")
-    plan = stages(mode, config)
+    level, = data.levels
+    plan = stages(mode, config, method)
+    is_na = method == "NA-ALISTA"
+    author_schedule = is_na and config.get("na_schedule") == "author"
+    patience = None if author_schedule else config["early_stopping_patience"]
+    decay = config.get("older_layer_gradient_decay", 0.3)
+    if not (0 < decay <= 1):
+        raise ValueError("older_layer_gradient_decay must be in (0, 1]")
     np.random.seed(config["seed"])
     torch.manual_seed(config["seed"])
+    signals = holdout = None
+    if is_na:
+        batch = 512 if author_schedule else config.get("na_batch_size", 512)
+        train_size = 50000 if author_schedule else config.get("na_samples_per_epoch", 50000)
+        if not 2 <= batch <= train_size:
+            raise ValueError("NA-ALISTA needs at least one complete training batch of size >= 2")
+        signals = sparse_signals(train_size, data.A.shape[1], data.config["nonzeros"])
+        if author_schedule:
+            holdout = sparse_signals(10000, data.A.shape[1], data.config["nonzeros"])
     model = build_model(method, data, depth).to(device)
-    if isinstance(model, NeuralALISTA):
-        y, _ = next(tensors(data, "train", batch, device))
-        model.calibrate(y)
     dest.parent.mkdir(parents=True, exist_ok=True)
     global_epoch, total_updates = 0, 0
     stage_records = []
@@ -129,32 +184,55 @@ def _fit(data, method, mode, config, device, dest, fingerprint):
         work = Path(temp) / "run"
         work.mkdir()
         with (work / "history.jsonl").open("w", encoding="utf-8") as history:
-            for active_depth, epoch_cap in plan:
-                params = trainable_parameters(model, mode, active_depth)
-                optimizer = torch.optim.Adam(params.values(), lr=config["learning_rate"])
-                best_score = math.inf
+            for phase in plan:
+                params = trainable_parameters(model, phase.name, phase.depth)
+                optimizer = torch.optim.Adam(params.values(), lr=phase.lr)
+                multipliers = gradient_factors(params, phase, decay)
+                # Keep the incoming same-depth checkpoint eligible across fine-tuning phases.
+                best_score = stage_records[-1]["best_val_nmse"] if phase.name.startswith("joint_") else math.inf
+                best_epoch = stage_records[-1]["best_epoch"] if phase.name.startswith("joint_") else global_epoch
                 start_epoch, start_updates = global_epoch, total_updates
-                stop_reason = "epoch_limit"
-                for stage_epoch in range(1, epoch_cap + 1):
+                wait, stop_reason = 0, "epoch_limit"
+                for stage_epoch in range(1, phase.epochs + 1):
                     model.train()
-                    for y, x in tensors(data, "train", batch, device, epoch=global_epoch):
+                    if is_na:
+                        if global_epoch:
+                            signals = sparse_signals(train_size, data.A.shape[1], data.config["nonzeros"])
+                        batches = author_batches(signals, model.A, level, batch, shuffle=True)
+                    else:
+                        batches = tensors(data, "train", batch, device, level=level, epoch=global_epoch)
+                    for y, x in batches:
+                        if is_na and total_updates == 0:
+                            model.calibrate(y)
                         optimizer.zero_grad(set_to_none=True)
-                        pred = model(y, active_depth, last_step_grad=(mode == "layerwise"))
-                        loss = (pred - x).square().mean()
+                        pred = model(y, phase.depth, last_step_grad=(phase.name == "new_layer"))
+                        squared_error = (pred - x).square()
+                        # The TF layerwise references minimize tf.nn.l2_loss.
+                        loss = 0.5 * squared_error.sum() if mode == "layerwise" else squared_error.mean()
                         if not torch.isfinite(loss):
                             raise FloatingPointError("Non-finite training loss")
                         loss.backward()
-                        torch.nn.utils.clip_grad_norm_(params.values(), 1.0, error_if_nonfinite=True)
+                        for parameter, factor in multipliers:
+                            parameter.grad.mul_(factor)
+                        max_norm = math.inf if mode == "layerwise" else 1.0
+                        torch.nn.utils.clip_grad_norm_(params.values(), max_norm, error_if_nonfinite=True)
                         optimizer.step()
                         total_updates += 1
                     global_epoch += 1
-                    validation, score = evaluate(model, data, "val", active_depth, batch, device)
-                    if score < best_score:
+                    if holdout is not None:
+                        score = author_holdout_score(model, holdout, level, batch, depth)
+                        validation = {"author_holdout": {"nmse": score}}
+                    else:
+                        validation, score = evaluate(model, data, "val", phase.depth, batch, device)
+                    if not math.isfinite(score):
+                        raise FloatingPointError("Non-finite validation score")
+                    if score < best_score or (author_schedule and score == best_score):
                         torch.save(model.state_dict(), work / "best.pt")
-                        best_score, best_epoch = score, global_epoch
-                    wait = global_epoch - best_epoch
-                    record = {"epoch": global_epoch, "stage_epoch": stage_epoch,
-                              "epochs_without_improvement": wait, "active_depth": active_depth,
+                        best_score, best_epoch, wait = score, global_epoch, 0
+                    else:
+                        wait += 1
+                    record = {"epoch": global_epoch, "stage_epoch": stage_epoch, "phase": phase.name,
+                              "epochs_without_improvement": wait, "active_depth": phase.depth,
                               "updates": total_updates, "val": validation, "mean_val_nmse": score}
                     history.write(json.dumps(record, allow_nan=False) + "\n")
                     history.flush()
@@ -162,32 +240,42 @@ def _fit(data, method, mode, config, device, dest, fingerprint):
                         stop_reason = "validation_patience"
                         break
                 model.load_state_dict(torch.load(work / "best.pt", map_location=device, weights_only=True))
-                stage_records.append({"depth": active_depth, "epochs": [start_epoch + 1, global_epoch],
-                                      "epoch_cap": epoch_cap, "epochs_run": stage_epoch,
-                                      "updates": total_updates - start_updates, "stop_reason": stop_reason,
-                                      "best_epoch": best_epoch, "best_val_nmse": best_score,
-                                      "trained_parameters": list(params)})
-                print("Stage depth={} epochs={} stop={} best_val_nmse={:.6g}".format(
-                    active_depth, stage_epoch, stop_reason, best_score), flush=True)
+                stage_records.append({"depth": phase.depth, "phase": phase.name, "learning_rate": phase.lr,
+                                      "epochs": [start_epoch + 1, global_epoch], "epoch_cap": phase.epochs,
+                                      "epochs_run": stage_epoch, "updates": total_updates - start_updates,
+                                      "stop_reason": stop_reason, "best_epoch": best_epoch,
+                                      "best_val_nmse": best_score, "trained_parameters": list(params)})
+                print(f"Depth {phase.depth} {phase.name}, epochs {stage_epoch}, {stop_reason}, "
+                      f"best NMSE {best_score:.6g}", flush=True)
         write_json(work / "run.json", {"experiment": identity, "device": str(device),
-                   "torch": str(torch.__version__), "epochs": global_epoch,
-                   "updates": total_updates, "stages": stage_records})
+                   "torch": torch.__version__, "epochs": global_epoch, "updates": total_updates,
+                   "training_data": "author_online" if is_na else "stored_single_snr",
+                   "selection": "author_holdout" if author_schedule else "fixed_validation",
+                   "batch_size": batch, "patience": patience, "stages": stage_records})
         work.rename(dest)
     print("Trained:", dest, "updates:", total_updates)
 
 
-def test_run(data, path, device, fingerprint):
+def load_checkpoint(data, path, device, fingerprint):
     run = json.loads((path / "run.json").read_text(encoding="utf-8"))["experiment"]
     if run["data_manifest_sha256"] != fingerprint:
         raise ValueError("The dataset differs from the one used to train this checkpoint")
     signature = run.get("evaluation_sha256", LEGACY_EVALUATORS.get(run["implementation_sha256"]))
-    if signature != implementation_sha256(EVALUATION_FILES):
+    # Earlier checkpoints use the same trained-weight forward equations.
+    if signature not in (implementation_sha256(EVALUATION_FILES),
+                         "e33783d3a46b7c21b13489d2ddc28847965e31e4967e524fa95eb716a3780fa7"):
         raise ValueError("Use the matching model and evaluation revision for this checkpoint")
+    cfg = run["training"]
+    model = build_model(run["method"], data, cfg["depth"]).to(device)
+    model.load_state_dict(torch.load(path / "best.pt", map_location=device, weights_only=True))
+    return run, model.eval()
+
+
+def test_run(data, path, device, fingerprint):
+    run, model = load_checkpoint(data, path, device, fingerprint)
     cfg = run["training"]
     previous_levels = single_level(data, cfg)
     try:
-        model = build_model(run["method"], data, cfg["depth"]).to(device)
-        model.load_state_dict(torch.load(path / "best.pt", map_location=device, weights_only=True))
         scores, _ = evaluate(model, data, "test", cfg["depth"], cfg["batch_size"], device)
     finally:
         restore_levels(data, previous_levels)
@@ -203,45 +291,44 @@ def main():
     parser.add_argument("action", choices=("train", "test"))
     parser.add_argument("--model", choices=("all",) + METHODS, default="all")
     parser.add_argument("--mode", choices=("both",) + MODES, default="both")
-    parser.add_argument("--data", type=Path, default=Path("data/main"))
-    parser.add_argument("--out", type=Path, default=Path("runs/v1"))
+    parser.add_argument("--data", type=Path)
+    parser.add_argument("--out", type=Path, default=DEFAULT_RUNS)
     parser.add_argument("--config", type=Path, default=BASE / "training.json")
     parser.add_argument("--seed", type=int, help="override the model initialization seed")
-    parser.add_argument("--snr", type=float, help="train and score one noise level in dB")
+    parser.add_argument("--snr", type=float, required=True, choices=(40, 20, 10, 5, math.inf))
+    parser.add_argument("--na-schedule", choices=("experiment", "author"),
+                        help="author uses 100 + 20 * depth epochs and a separate synthetic holdout")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
     cfg = json.loads(args.config.read_text(encoding="utf-8"))
     if args.seed is not None:
         cfg["seed"] = args.seed
+    if args.na_schedule is not None:
+        cfg["na_schedule"] = args.na_schedule
     models = METHODS if args.model == "all" else (args.model,)
     modes = MODES if args.mode == "both" else (args.mode,)
     if not (type(cfg["depth"]) is int and cfg["depth"] >= 1 and cfg["batch_size"] >= 1
             and math.isfinite(cfg["learning_rate"]) and cfg["learning_rate"] > 0
             and 0 <= cfg["seed"] < 2**32):
         parser.error("Invalid training configuration")
-    if args.action == "train":
-        try:
-            for mode in modes:
-                stages(mode, cfg)
-        except ValueError as error:
-            parser.error(str(error))
+    jobs = [(m, mode) for m in models for mode in modes if mode in supported_modes(m)]
+    if args.action == "test" and args.model == "NA-ALISTA" and args.mode == "layerwise":
+        jobs = [(args.model, args.mode)]  # Evaluation of a historical checkpoint.
+    if not jobs:
+        parser.error("NA-ALISTA is trained end-to-end only")
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.use_deterministic_algorithms(True)
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
+    args.data = args.data or Path("data/noiseless" if math.isinf(args.snr) else "data/main")
     data = RecoveryData(args.data)
-    if args.snr is not None:
-        cfg["snr_db"] = matched_level(data, args.snr)
+    cfg["snr_db"] = matched_level(data, args.snr)
     fingerprint = hashlib.sha256((args.data / "manifest.json").read_bytes()).hexdigest()
-    for method in models:
-        for mode in modes:
-            dest = args.out / method / mode
-            if "snr_db" in cfg:
-                dest = dest / ("snr-" + level_key(cfg["snr_db"]))
-            dest = dest / ("seed-" + str(cfg["seed"]))
-            if args.action == "train":
-                fit(data, method, mode, cfg, device, dest, fingerprint)
-            else:
-                test_run(data, dest, device, fingerprint)
+    for method, mode in jobs:
+        dest = args.out / method / mode / ("snr-" + level_key(cfg["snr_db"])) / ("seed-" + str(cfg["seed"]))
+        if args.action == "train":
+            fit(data, method, mode, cfg, device, dest, fingerprint)
+        else:
+            test_run(data, dest, device, fingerprint)
 
 
 if __name__ == "__main__":

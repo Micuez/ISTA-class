@@ -5,11 +5,12 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import shutil
 from tempfile import TemporaryDirectory
 
 import numpy as np
 
-from dataset import FORMAT_VERSION, SPLITS, level_key
+from dataset import FORMAT_VERSION, SPLITS, RecoveryData, level_key
 
 
 def validate(config):
@@ -104,12 +105,47 @@ def generate(config, dest):
     return manifest
 
 
+def generate_noiseless(source, dest):
+    """Derive the fifth condition from the exact same dictionary and clean splits."""
+    data = RecoveryData(source)
+    dest = Path(dest)
+    if dest.exists():
+        raise FileExistsError("Dataset already exists: " + str(dest))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(dir=dest.parent) as staging:
+        root = Path(staging) / "dataset"
+        root.mkdir()
+        for name in ("A.npy", "W.npy"):
+            shutil.copyfile(data.root / name, root / name)
+        for split in SPLITS:
+            (root / split).mkdir()
+            shutil.copyfile(data.root / split / "x.npy", root / split / "x.npy")
+            x = np.load(root / split / "x.npy", allow_pickle=False)
+            np.save(root / split / "y_infdB.npy", x @ data.A.T)
+        manifest = {
+            "format_version": FORMAT_VERSION, "numpy_version": np.__version__,
+            "config": dict(data.config, snr_db=["inf"]),
+            "measured_snr_db": {s: {"inf": "inf"} for s in SPLITS},
+            "sha256": {p.relative_to(root).as_posix(): sha256(p)
+                       for p in sorted(root.rglob("*.npy"))},
+        }
+        (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        root.rename(dest)
+    return manifest
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("experiment.json"))
-    parser.add_argument("--out", type=Path, default=Path("data/main"))
+    parser.add_argument("--noiseless-from", type=Path, help="derive clean observations from this dataset")
+    parser.add_argument("--out", type=Path)
     args = parser.parse_args()
-    with args.config.open(encoding="utf-8") as stream:
-        manifest = generate(json.load(stream), args.out)
+    if args.noiseless_from is not None:
+        args.out = args.out or Path("data/noiseless")
+        manifest = generate_noiseless(args.noiseless_from, args.out)
+    else:
+        args.out = args.out or Path("data/main")
+        with args.config.open(encoding="utf-8") as stream:
+            manifest = generate(json.load(stream), args.out)
     print(args.out.resolve())
     print(json.dumps(manifest["measured_snr_db"], indent=2))

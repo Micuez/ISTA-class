@@ -1,12 +1,12 @@
-"""Plot layer-wise validation NMSE and end-to-end per-sample NMSE."""
+"""Evaluate all depths from one frozen final checkpoint per model, mode and SNR."""
 
+import argparse
 import csv
-import json
+import hashlib
 import math
 from pathlib import Path
 
 import matplotlib
-
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,231 +14,185 @@ import torch
 
 from dataset import RecoveryData, level_key
 from evaluation import tensors
-from models import METHODS, build_model
+from generate import sha256
+from models import METHODS
+from train import DEFAULT_RUNS, MODES, load_checkpoint, matched_level, supported_modes
+from verify_data import check_paired_signals
 
 
-ROOT = Path(__file__).resolve().parent
-OUT = ROOT / "runs" / "single-snr"
-FIGURES = OUT / "figures"
 SNRS = (40, 20, 10, 5, float("inf"))
-COLORS = {
-    "EBT-LISTA": "#0072B2",
-    "HLISTA": "#E69F00",
-    "ALISTA": "#009E73",
-    "NA-ALISTA": "#D55E00",
-}
+COLORS = {"EBT-LISTA": "#0072B2", "HLISTA": "#D98600", "ALISTA": "#008364",
+          "ELISTA": "#7656A4", "NA-ALISTA": "#C45112"}
 
 
-def use_cjk_font():
-    from matplotlib import font_manager
-    for path in (
-        ROOT / "fonts" / "wqy-microhei.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-    ):
-        if Path(path).is_file():
-            font_manager.fontManager.addfont(path)
-            matplotlib.rcParams["font.family"] = font_manager.FontProperties(fname=path).get_name()
-            break
-    matplotlib.rcParams["axes.unicode_minus"] = False
-
-
-def run_dir(method, mode, snr):
-    return OUT / method / mode / ("snr-" + level_key(snr)) / "seed-0"
-
-
-def snr_title(snr):
-    if math.isinf(float(snr)):
-        return "SNR = 无穷"
-    return "SNR = {} dB".format(snr)
-
-
-def same_snr(left, right):
-    left, right = float(left), float(right)
-    return math.isinf(left) and math.isinf(right) or left == right
-
-
-def panel_axes(count):
-    figure, axes = plt.subplots(2, 3, figsize=(15.5, 8.2))
-    flat = list(axes.ravel())
-    for axis in flat[count:]:
-        axis.axis("off")
-    return figure, flat[:count]
-
-
-def dataset_for(snr):
-    root = ROOT / "data" / ("noiseless" if math.isinf(float(snr)) else "main")
-    data = RecoveryData(root)
-    for level in data.levels:
-        if same_snr(level, snr):
-            return data, level
-    raise ValueError("SNR is not in {}: {}".format(root, snr))
-
-
-def metric_db(value):
-    if value == "-inf":
-        return -np.inf
-    return float(value)
-
-
-def layerwise_table():
-    rows = []
-    for method in METHODS:
-        for snr in SNRS:
-            path = run_dir(method, "layerwise", snr)
-            run = json.loads((path / "run.json").read_text(encoding="utf-8"))
-            history = {
-                record["epoch"]: record
-                for record in map(json.loads, (path / "history.jsonl").read_text(encoding="utf-8").splitlines())
-            }
-            key = level_key(snr)
-            for stage in run["stages"]:
-                record = history[stage["best_epoch"]]
-                metrics = record["val"][key]
-                rows.append({
-                    "model": method,
-                    "snr_db": snr,
-                    "layer": stage["depth"],
-                    "best_epoch": stage["best_epoch"],
-                    "epochs_run": stage["epochs_run"],
-                    "updates": stage["updates"],
-                    "stop_reason": stage["stop_reason"],
-                    "val_nmse": metrics["nmse"],
-                    "val_nmse_db": metric_db(metrics["nmse_db"]),
-                    "val_top_k_support_f1": metrics["top_k_support_f1"],
-                })
-    return rows
+@torch.inference_mode()
+def fixed_depth_metrics(model, data, snr, depth, batch, device, split):
+    model.eval()
+    errors = torch.zeros(depth, dtype=torch.float64, device=device)
+    hits = torch.zeros(depth, dtype=torch.int64, device=device)
+    energy = torch.zeros((), dtype=torch.float64, device=device)
+    k = data.config["nonzeros"]
+    count, samples = 0, []
+    for y, x in tensors(data, split, batch, device, level=snr):
+        target = x.double()
+        signal_energy = target.square().sum(dim=1)
+        energy += signal_energy.sum()
+        count += len(x)
+        # All depths come from this one unroll, including the same recurrent state.
+        for idx, estimate in enumerate(model(y, depth, return_path=True)):
+            per_signal = (estimate.double() - target).square().sum(dim=1)
+            errors[idx] += per_signal.sum()
+            indices = estimate.abs().argsort(dim=1, descending=True, stable=True)[:, :k]
+            hits[idx] += x.gather(1, indices).count_nonzero()
+        samples.append((10 * torch.log10(per_signal / signal_energy)).cpu().numpy())
+    ratios = (errors / energy).cpu().numpy()
+    if not np.isfinite(ratios).all():
+        raise ValueError("Non-finite fixed-checkpoint NMSE")
+    with np.errstate(divide="ignore"):
+        db = 10 * np.log10(ratios)
+    rows = [{"layer": idx + 1, "signals": count, "nmse": float(ratio), "nmse_db": float(db[idx]),
+             "top_k_support_f1": hits[idx].item() / (count * k)} for idx, ratio in enumerate(ratios)]
+    samples = np.concatenate(samples)
+    if np.isnan(samples).any() or np.isposinf(samples).any():
+        raise ValueError("Undefined per-signal NMSE; check target energy and predictions")
+    return rows, samples
 
 
 def write_csv(path, rows):
-    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
 
 
-def plot_layerwise(rows):
-    figure, axes = panel_axes(len(SNRS))
-    for axis, snr in zip(axes, SNRS):
-        for method in METHODS:
-            selected = [row for row in rows if row["model"] == method and same_snr(row["snr_db"], snr)]
-            selected.sort(key=lambda row: row["layer"])
-            axis.plot(
-                [row["layer"] for row in selected],
-                [row["val_nmse_db"] for row in selected],
-                marker="o", markersize=3.5, linewidth=1.4,
-                color=COLORS[method], label=method,
-            )
-        axis.set_title(snr_title(snr))
-        axis.set_xlabel("层数")
-        axis.set_ylabel("恢复误差 NMSE (dB)")
-        axis.set_xticks(range(1, 17))
-        axis.grid(True, linewidth=0.4, alpha=0.5)
-    axes[0].legend(frameon=False, fontsize=8)
-    figure.tight_layout()
-    figure.savefig(FIGURES / "layerwise_val_nmse.png", dpi=160)
-    figure.savefig(FIGURES / "layerwise_val_nmse.pdf")
-    plt.close(figure)
-    for snr in SNRS:
-        single, axis = plt.subplots(figsize=(7.2, 4.4))
-        for method in METHODS:
-            selected = [row for row in rows if row["model"] == method and same_snr(row["snr_db"], snr)]
-            selected.sort(key=lambda row: row["layer"])
-            axis.plot(
-                [row["layer"] for row in selected],
-                [row["val_nmse_db"] for row in selected],
-                marker="o", markersize=3.5, linewidth=1.4,
-                color=COLORS[method], label=method,
-            )
-        axis.set_title(snr_title(snr))
-        axis.set_xlabel("层数")
-        axis.set_ylabel("恢复误差 NMSE (dB)")
-        axis.set_xticks(range(1, 17))
-        axis.grid(True, linewidth=0.4, alpha=0.5)
-        axis.legend(frameon=False, fontsize=8)
-        single.tight_layout()
-        stem = "layerwise_snr_{}".format(level_key(snr))
-        single.savefig(FIGURES / (stem + ".png"), dpi=160)
-        single.savefig(FIGURES / (stem + ".pdf"))
-        plt.close(single)
+def title(snr):
+    return "Noiseless" if math.isinf(snr) else f"{level_key(snr)} dB"
 
 
-@torch.no_grad()
-def per_sample_nmse_db(model, data, snr, depth, batch_size, device):
-    values = []
-    for observations, signals in tensors(data, "val", batch_size, device, snr):
-        prediction = model(observations, depth)
-        error = (prediction.double() - signals.double()).square().sum(dim=1)
-        energy = signals.double().square().sum(dim=1).clamp_min(torch.finfo(torch.float64).tiny)
-        values.append((10 * torch.log10(error / energy)).cpu().numpy())
-    return np.concatenate(values)
+def draw_curves(rows, levels, modes, methods, split, directory):
+    fig, axes = plt.subplots(len(modes), len(levels), squeeze=False, sharex=True,
+                             figsize=(max(5, 3.35 * len(levels)), 3.4 * len(modes) + 0.6))
+    handles = {}
+    depth = max(item["layer"] for item in rows)
+    ticks = sorted({1, depth, *range(4, depth + 1, 4)})
+    for row_idx, mode in enumerate(modes):
+        for col, snr in enumerate(levels):
+            axis = axes[row_idx, col]
+            for method in methods:
+                series = [v for v in rows if (v["model"], v["mode"], v["snr_db"]) ==
+                          (method, mode, level_key(snr))]
+                if series:
+                    layers = [v["layer"] for v in series]
+                    db = np.array([v["nmse_db"] for v in series])
+                    line, = axis.plot(layers, np.ma.masked_invalid(db), ".-", color=COLORS[method],
+                                      linewidth=1.6, label=method)
+                    handles[method] = line
+                    if np.isneginf(db).any():
+                        for layer in np.asarray(layers)[np.isneginf(db)]:
+                            axis.text(layer, 0.015, "−∞", transform=axis.get_xaxis_transform(),
+                                      ha="center", color=COLORS[method], fontsize=8)
+            axis.set_title(title(snr))
+            axis.set_xticks(ticks)
+            if col == 0:
+                label = "Layerwise" if mode == "layerwise" else "End-to-end"
+                axis.set_ylabel(f"{label}\n{split.capitalize()} NMSE (dB)")
+            if row_idx == len(modes) - 1:
+                axis.set_xlabel("Unfolded depth")
+            axis.grid(alpha=0.22)
+    fig.legend([handles[m] for m in methods if m in handles], [m for m in methods if m in handles],
+               loc="lower center", ncol=len(handles), frameon=False)
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    for ext in ("png", "pdf"):
+        fig.savefig(directory / f"fixed_depth_{split}_nmse.{ext}", dpi=160)
+    plt.close(fig)
 
 
-def plot_end_to_end(device):
-    batch_size = json.loads((ROOT / "training.json").read_text(encoding="utf-8"))["batch_size"]
-    samples = []
-    summaries = []
-    for method in METHODS:
-        for snr in SNRS:
-            data, level = dataset_for(snr)
-            path = run_dir(method, "end_to_end", snr)
-            state = torch.load(path / "best.pt", map_location=device, weights_only=True)
-            model = build_model(method, data, 16).to(device)
-            model.load_state_dict(state)
-            model.eval()
-            scores = per_sample_nmse_db(model, data, level, 16, batch_size, device)
-            for value in scores:
-                samples.append({"model": method, "snr_db": snr, "val_nmse_db": float(value)})
-            summaries.append({
-                "model": method,
-                "snr_db": snr,
-                "signals": int(scores.size),
-                "median_nmse_db": float(np.median(scores)),
-                "q1_nmse_db": float(np.percentile(scores, 25)),
-                "q3_nmse_db": float(np.percentile(scores, 75)),
-            })
-            del model
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-    figure, axes = panel_axes(len(SNRS))
-    for axis, snr in zip(axes, SNRS):
-        groups = [
-            [row["val_nmse_db"] for row in samples if row["model"] == method and same_snr(row["snr_db"], snr)]
-            for method in METHODS
-        ]
-        drawn = axis.boxplot(
-            groups, patch_artist=True, widths=0.6,
-            medianprops={"color": "black", "linewidth": 1.2},
-        )
-        for patch, method in zip(drawn["boxes"], METHODS):
+def draw_boxes(values, levels, methods, split, directory):
+    fig, axes = plt.subplots(1, len(levels), squeeze=False, figsize=(max(5, len(levels) * 3.3), 4))
+    for axis, snr in zip(axes[0], levels):
+        groups = [values[(m, level_key(snr))] for m in methods]
+        finite = [group[np.isfinite(group)] for group in groups]
+        boxes = axis.boxplot(finite, patch_artist=True, widths=0.55, medianprops={"color": "black"})
+        for patch, method in zip(boxes["boxes"], methods):
             patch.set_facecolor(COLORS[method])
-            patch.set_alpha(0.85)
-        axis.set_title(snr_title(snr))
-        axis.set_xticks(range(1, len(METHODS) + 1))
-        axis.set_xticklabels(METHODS, rotation=15)
-        axis.set_ylabel("恢复误差 NMSE (dB)")
-        axis.grid(True, axis="y", linewidth=0.4, alpha=0.5)
-    figure.tight_layout()
-    figure.savefig(FIGURES / "end_to_end_val_nmse_boxplot.png", dpi=160)
-    figure.savefig(FIGURES / "end_to_end_val_nmse_boxplot.pdf")
-    plt.close(figure)
-    return samples, summaries
+            patch.set_alpha(0.78)
+        labels = [method if len(group) == len(shown) else f"{method}\n{len(group) - len(shown)} exact"
+                  for method, group, shown in zip(methods, groups, finite)]
+        axis.set_xticks(range(1, len(methods) + 1), labels=labels, rotation=28, ha="right")
+        axis.set_title(title(snr))
+        axis.grid(axis="y", alpha=0.22)
+    axes[0, 0].set_ylabel("End-to-end sample NMSE (dB)")
+    fig.tight_layout()
+    for ext in ("png", "pdf"):
+        fig.savefig(directory / f"end_to_end_{split}_nmse_boxplot.{ext}", dpi=160)
+    plt.close(fig)
 
 
 def main():
-    use_cjk_font()
-    FIGURES.mkdir(parents=True, exist_ok=True)
-    rows = layerwise_table()
-    write_csv(OUT / "layerwise_val_nmse.csv", rows)
-    plot_layerwise(rows)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    samples, summaries = plot_end_to_end(device)
-    write_csv(OUT / "end_to_end_val_samples.csv", samples)
-    write_csv(OUT / "end_to_end_val_boxplot.csv", summaries)
-    print("wrote", FIGURES)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--runs", type=Path, default=DEFAULT_RUNS)
+    parser.add_argument("--data-main", type=Path, default=Path("data/main"))
+    parser.add_argument("--data-noiseless", type=Path, default=Path("data/noiseless"))
+    parser.add_argument("--snrs", type=float, nargs="+", default=SNRS, choices=SNRS)
+    parser.add_argument("--methods", nargs="+", choices=METHODS, default=METHODS)
+    parser.add_argument("--modes", nargs="+", choices=MODES, default=("layerwise", "end_to_end"))
+    parser.add_argument("--include-legacy-na", action="store_true",
+                        help="also read the truncated-gradient NA-ALISTA runs from the previous grid")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--split", choices=("val", "test"), default="val")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    args = parser.parse_args()
+    device = torch.device(("cuda" if torch.cuda.is_available() else "cpu")
+                          if args.device == "auto" else args.device)
+    rows, samples, quartiles, boxes = [], [], [], {}
+    datasets = {}
+    for snr in args.snrs:
+        root = args.data_noiseless if math.isinf(snr) else args.data_main
+        if root not in datasets:
+            datasets[root] = RecoveryData(root), hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest()
+    if len(datasets) == 2:
+        check_paired_signals(datasets[args.data_main][0], datasets[args.data_noiseless][0])
+    for snr in args.snrs:
+        key = level_key(snr)
+        root = args.data_noiseless if math.isinf(snr) else args.data_main
+        data, fingerprint = datasets[root]
+        level = matched_level(data, snr)
+        for method in args.methods:
+            for mode in args.modes:
+                if mode not in supported_modes(method) and not args.include_legacy_na:
+                    continue
+                path = args.runs / method / mode / ("snr-" + key) / f"seed-{args.seed}"
+                run, model = load_checkpoint(data, path, device, fingerprint)
+                cfg = run["training"]
+                if (run["method"], run["mode"], cfg["seed"], level_key(cfg["snr_db"])) != (
+                        method, mode, args.seed, key):
+                    raise ValueError(f"Checkpoint identity differs from {path}")
+                metrics, scores = fixed_depth_metrics(model, data, level, cfg["depth"],
+                                                       cfg["batch_size"], device, args.split)
+                metadata = {"model": method, "mode": mode, "snr_db": key, "seed": args.seed,
+                            "split": args.split, "checkpoint_sha256": sha256(path / "best.pt")}
+                rows.extend({**metadata, **item} for item in metrics)
+                if mode == "end_to_end":
+                    boxes[method, key] = scores
+                    samples.extend({"model": method, "snr_db": key, "sample": i, "nmse_db": float(v)}
+                                   for i, v in enumerate(scores))
+                    finite = scores[np.isfinite(scores)]
+                    q1, med, q3 = np.percentile(finite, [25, 50, 75]) if len(finite) else (None, None, None)
+                    quartiles.append({"model": method, "snr_db": key, "signals": len(scores),
+                                      "finite_db": len(finite), "exact_recoveries": len(scores) - len(finite),
+                                      "q1_nmse_db": q1, "median_nmse_db": med, "q3_nmse_db": q3})
+    if not rows:
+        parser.error("The selection has no trained model/mode combinations")
+    figures = args.runs / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    write_csv(args.runs / f"fixed_depth_{args.split}_nmse.csv", rows)
+    drawn_modes = [mode for mode in args.modes if any(row["mode"] == mode for row in rows)]
+    draw_curves(rows, args.snrs, drawn_modes, args.methods, args.split, figures)
+    if boxes:
+        write_csv(args.runs / f"end_to_end_{args.split}_samples.csv", samples)
+        write_csv(args.runs / f"end_to_end_{args.split}_boxplot.csv", quartiles)
+        draw_boxes(boxes, args.snrs, args.methods, args.split, figures)
+    print(f"{len(rows)} fixed-checkpoint depth scores, figures in {figures}")
 
 
 if __name__ == "__main__":

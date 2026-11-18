@@ -10,6 +10,13 @@ from dataset import RecoveryData, SPLITS, level_key
 from generate import sha256
 
 
+def check_paired_signals(finite, noiseless):
+    files = ["A.npy", "W.npy", *(f"{split}/x.npy" for split in SPLITS)]
+    for name in files:
+        if finite.manifest["sha256"][name] != noiseless.manifest["sha256"][name]:
+            raise ValueError(f"The finite-SNR and noiseless datasets differ in {name}")
+
+
 def verify(root):
     data = RecoveryData(root)
     for name, expected in data.manifest["sha256"].items():
@@ -36,6 +43,11 @@ def verify(root):
             y, _ = data.arrays(split, db)
             if y.shape != (len(x), a.shape[0]):
                 raise ValueError("Invalid observation shape in " + split)
+            if float(db) == float("inf"):
+                # float32 BLAS may differ by rounding across the server and CPU.
+                np.testing.assert_allclose(y, clean, rtol=3e-6, atol=3e-6)
+                actual[split]["inf"] = "inf"
+                continue
             error = y - clean
             db_measured = 10 * np.log10(np.sum(clean**2) / np.sum(error**2))
             np.testing.assert_allclose(db_measured, data.manifest["measured_snr_db"][split][level_key(db)],

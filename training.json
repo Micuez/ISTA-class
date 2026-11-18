@@ -1,8 +1,13 @@
 {
   "depth": 16,
-  "max_epochs_per_stage": 100000,
-  "early_stopping_patience": 5,
+  "max_epochs_per_layer": 1000,
+  "max_epochs_end_to_end": 100000,
+  "early_stopping_patience": 50,
   "batch_size": 64,
   "learning_rate": 0.001,
+  "layerwise_learning_rate": 0.0005,
+  "finetune_lr_factors": [0.2, 0.02],
+  "older_layer_gradient_decay": 0.3,
+  "na_schedule": "experiment",
   "seed": 0
 }
