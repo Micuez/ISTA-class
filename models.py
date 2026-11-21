@@ -232,7 +232,8 @@ class SALISTA(nn.Module):
 
     def __init__(self, A, W, sparsity, depth, *, initial_l1_bound, noise_l2_bound,
                  cell="gru", sharing="shared", hidden_size=32, gamma_min=0.5,
-                 gamma_max=1.1, beta_max=0.2, eta=0.05, stall_threshold_ratio=None):
+                 gamma_max=1.1, beta_max=0.2, eta=0.05, stall_threshold_ratio=None,
+                 free_threshold=False, free_step=False):
         super().__init__()
         if A.ndim != 2 or min(A.shape) < 1 or A.dtype not in (torch.float32, torch.float64):
             raise ValueError("A must be a real float32/float64 [m,n] tensor")
@@ -247,6 +248,10 @@ class SALISTA(nn.Module):
         if stall_threshold_ratio is not None and (type(stall_threshold_ratio) not in (int, float)
                                                  or not 0 < stall_threshold_ratio < 1):
             raise ValueError("stall_threshold_ratio must be null or in (0, 1)")
+        if type(free_threshold) is not bool:
+            raise ValueError("free_threshold must be a bool")
+        if type(free_step) is not bool:
+            raise ValueError("free_step must be a bool")
         controls = (initial_l1_bound, noise_l2_bound, gamma_min, gamma_max, beta_max, eta)
         if (not all(type(v) in (float, int) and math.isfinite(v) for v in controls)
                 or min(initial_l1_bound, noise_l2_bound, beta_max, eta) < 0
@@ -259,6 +264,8 @@ class SALISTA(nn.Module):
         self.gamma_min, self.gamma_max = gamma_min, gamma_max
         self.beta_max, self.eta = beta_max, eta
         self.stall_threshold_ratio = stall_threshold_ratio
+        self.free_threshold = free_threshold
+        self.free_step = free_step
         self.depth, self.sharing = depth, sharing
         blocks = 1 if sharing == "shared" else depth
         self.layers = nn.ModuleList(CoordinateController(cell, hidden_size, sharing == "shared" or i > 0)
@@ -297,21 +304,33 @@ class SALISTA(nn.Module):
                                               cert.omega.expand_as(x)), dim=2)
                 block = self.stage_module(i + 1)
                 features, state = block(global_features, local_features, state)
-                step_fraction = block.step(features).squeeze(-1).sigmoid()
-                gamma = self.gamma_min + (self.gamma_max - self.gamma_min) * step_fraction
+                step_raw = block.step(features).squeeze(-1)
+                if self.free_step:
+                    gamma = F.softplus(step_raw)
+                else:
+                    gamma = self.gamma_min + (self.gamma_max - self.gamma_min) * step_raw.sigmoid()
                 beta = self.beta_max * block.momentum(features).squeeze(-1).sigmoid() if i else torch.zeros_like(x)
                 lower = gamma * (interference + self.noise_l2_bound * cert.omega)
                 threshold_features = torch.cat((features, lower.log1p().unsqueeze(-1)), dim=2)
                 proposal = F.softplus(block.threshold(threshold_features).squeeze(-1))
-                delta = project_threshold_budget(proposal, self.eta * budget)
-                reference_theta = lower + delta
                 z = x + gamma * c + beta * change
-                if self.stall_threshold_ratio is None:
-                    theta = reference_theta
+                if self.free_threshold:
+                    # Learned per-coordinate threshold, without the certificate floor,
+                    # the l1 budget projection, or the stall rescaling.
+                    delta = proposal
+                    reference_theta = proposal
+                    theta = proposal
                     scale = torch.ones_like(budget)
                 else:
-                    theta, scale, stalled = rescale_stalled_threshold(z, reference_theta, self.stall_threshold_ratio)
-                    support_certified = support_certified & ~stalled
+                    delta = project_threshold_budget(proposal, self.eta * budget)
+                    reference_theta = lower + delta
+                    if self.stall_threshold_ratio is None:
+                        theta = reference_theta
+                        scale = torch.ones_like(budget)
+                    else:
+                        theta, scale, stalled = rescale_stalled_threshold(
+                            z, reference_theta, self.stall_threshold_ratio)
+                        support_certified = support_certified & ~stalled
                 next_x = shrink(z, theta)
                 if i + 1 < depth or return_diagnostics:
                     triangle = self.initial_l1_bound + next_x.abs().sum(1, keepdim=True)

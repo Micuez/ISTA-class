@@ -208,6 +208,45 @@ class SALISTATests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "stall_threshold_ratio"):
             SALISTA(A, A, 1, 3, stall_threshold_ratio=1., **settings)
 
+    def test_free_threshold_is_not_bound_to_the_certificate(self):
+        A = torch.eye(4)
+        settings = dict(initial_l1_bound=3., noise_l2_bound=0.5, stall_threshold_ratio=.8, eta=0.05)
+        bound = SALISTA(A, A, 2, 2, **settings)
+        free = SALISTA(A, A, 2, 2, free_threshold=True, **settings)
+        free.load_state_dict(bound.state_dict())
+        free.layers[0].threshold.bias.data.fill_(-2.)
+        y = torch.tensor([[1., 0., 0., 0.], [.2, -.1, .4, 0.]])
+        _, bound_trace = bound(y, 2, return_diagnostics=True)
+        prediction, free_trace = free(y, 2, return_diagnostics=True)
+        self.assertFalse(torch.allclose(bound_trace[0]["theta"], free_trace[0]["theta"]))
+        self.assertGreater(free_trace[0]["theta"].sum().item(), (free.eta * free_trace[0]["budget"]).sum().item())
+        self.assertTrue(torch.equal(free_trace[0]["threshold_scale"], torch.ones(len(y), 1)))
+        self.assertTrue(free_trace[0]["support_certified"].all())
+        self.assertTrue(torch.isfinite(prediction).all())
+        prediction.square().mean().backward()
+        self.assertGreater(free.layers[0].threshold.weight.grad.abs().sum().item(), 0.)
+        with self.assertRaisesRegex(ValueError, "free_threshold"):
+            SALISTA(A, A, 1, 1, initial_l1_bound=1., noise_l2_bound=0., free_threshold=1)
+
+    def test_free_step_is_not_boxed_into_the_configured_interval(self):
+        A = torch.eye(3)
+        settings = dict(initial_l1_bound=2., noise_l2_bound=0., gamma_min=0.5, gamma_max=1.1, beta_max=0.)
+        boxed = SALISTA(A, A, 1, 1, **settings)
+        free = SALISTA(A, A, 1, 1, free_step=True, **settings)
+        free.load_state_dict(boxed.state_dict())
+        free.layers[0].step.bias.data.fill_(4.)
+        y = torch.tensor([[1., 0., 0.]])
+        _, boxed_trace = boxed(y, 1, return_diagnostics=True)
+        _, free_trace = free(y, 1, return_diagnostics=True)
+        self.assertTrue((boxed_trace[0]["gamma"] >= 0.5).all())
+        self.assertTrue((boxed_trace[0]["gamma"] <= 1.1).all())
+        self.assertGreater(free_trace[0]["gamma"].min().item(), 1.1)
+        free.layers[0].step.bias.data.fill_(-8.)
+        _, tiny = free(y, 1, return_diagnostics=True)
+        self.assertLess(tiny[0]["gamma"].max().item(), 0.5)
+        with self.assertRaisesRegex(ValueError, "free_step"):
+            SALISTA(A, A, 1, 1, initial_l1_bound=1., noise_l2_bound=0., free_step=1)
+
     def test_production_trainer_and_checkpoint(self):
         cfg = json.loads(Path(__file__).with_name("training.salista.json").read_text())
         cfg.update(depth=2, batch_size=4, max_epochs_end_to_end=1, snr_db=20)

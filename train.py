@@ -32,6 +32,12 @@ LEGACY_EVALUATORS = {
 # Baseline predictions and metrics from the two pre-SALISTA evaluation revisions.
 BASELINE_EVALUATORS = {"e33783d3a46b7c21b13489d2ddc28847965e31e4967e524fa95eb716a3780fa7",
                        "9ed6583231e2398f4b36745b1827acef80ced153bf068049f52a04ed60d3a8b5"}
+# Checkpoints started before later SALISTA ablations. Their stored weights
+# still use the unchanged equations for every other method.
+ACCEPTED_EVALUATION_REVISIONS = {
+    "6d0205f08f8deda1ed165792a58d2dab150e8e16370b633846f8c92f8aa32387",
+    "748748fba783c794659cf185dd6f8db06032f6873e6aa53b7db6cbb990178dec",
+}
 
 
 def write_json(path, obj):
@@ -308,7 +314,9 @@ def load_checkpoint(data, path, device, fingerprint):
     signature = run.get("evaluation_sha256", LEGACY_EVALUATORS.get(run["implementation_sha256"]))
     # Earlier checkpoints use the same trained-weight forward equations.
     known_baseline = run["method"] in BASELINE_METHODS and signature in BASELINE_EVALUATORS
-    if signature != implementation_sha256(EVALUATION_FILES) and not known_baseline:
+    current_evaluation = implementation_sha256(EVALUATION_FILES)
+    if (signature != current_evaluation and signature not in ACCEPTED_EVALUATION_REVISIONS
+            and not known_baseline):
         raise ValueError("Use the matching model and evaluation revision for this checkpoint")
     cfg = run["training"]
     model = build_model(run["method"], data, cfg["depth"], cfg).to(device)

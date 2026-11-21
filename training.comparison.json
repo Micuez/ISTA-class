@@ -24,6 +24,8 @@
     "beta_max": 0.2,
     "eta": 0.05,
     "stall_threshold_ratio": 0.8,
+    "free_threshold": true,
+    "free_step": true,
     "bounds": {"mode": "online_gaussian", "failure_probability": 0.01}
   }
 }
