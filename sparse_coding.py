@@ -2,7 +2,7 @@
 
 Each row of y is a signal. Dictionary atoms are columns of a shared [m,n]
 or per-signal [N,m,n] dictionary. The task requires no coefficient labels.
-The CLI trains end to end and selects by mean validation objective.
+Train end to end or at increasing depth, selecting by mean validation objective.
 NPZ splits are train_y/val_y/test_y, with shared D or corresponding split_D.
 """
 
@@ -31,22 +31,23 @@ def _check_inputs(signals, dictionary):
         raise ValueError("Store signals and dictionary on the same device")
 
 
-def sparse_encode(model, signals, dictionary, depth):
+def sparse_encode(model, signals, dictionary, depth, *, last_step_grad=False):
     """Return [N,n] codes, retaining gradients for training. Inputs match model.A."""
     _check_inputs(signals, dictionary)
     if type(depth) is not int or depth < 1:
         raise ValueError("depth must be a positive integer")
     if signals.device != model.A.device or signals.dtype != model.A.dtype:
         raise ValueError("Move the batch or model so their dtype and device match")
+    kwargs = {"last_step_grad": True} if last_step_grad else {}
     if getattr(model, "supports_variable_dictionary", False):
-        return model(signals, depth, dictionary=dictionary)
+        return model(signals, depth, dictionary=dictionary, **kwargs)
     if dictionary.ndim != 2 or not torch.equal(dictionary, model.A):
         raise ValueError("This fixed-dictionary model requires its original [m,n] dictionary")
-    return model(signals, depth)
+    return model(signals, depth, **kwargs)
 
 
 def sparse_coding_epoch(model, signals, dictionary, depth, l1, *, batch_size=64,
-                        optimizer=None, generator=None):
+                        optimizer=None, generator=None, last_step_grad=False, gradient_multipliers=()):
     """Train one epoch with optimizer, or score without gradients. Include the last batch.
 
     Returns per-signal means. Reconstruction is half the squared residual norm.
@@ -68,7 +69,7 @@ def sparse_coding_epoch(model, signals, dictionary, depth, l1, *, batch_size=64,
         for indices in order.split(batch_size):
             y = signals[indices].to(device)
             d = shared if shared is not None else dictionary[indices].to(device)
-            z = sparse_encode(model, y, d, depth)
+            z = sparse_encode(model, y, d, depth, last_step_grad=last_step_grad)
             predicted = z @ d.T if d.ndim == 2 else torch.bmm(d, z.unsqueeze(2)).squeeze(2)
             reconstruction = 0.5 * (predicted - y).square().sum(1)
             code_l1 = z.abs().sum(1)
@@ -78,6 +79,9 @@ def sparse_coding_epoch(model, signals, dictionary, depth, l1, *, batch_size=64,
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 objective.backward()
+                for parameter, factor in gradient_multipliers:
+                    if parameter.grad is not None:
+                        parameter.grad.mul_(factor)
                 optimizer.step()
             totals += torch.stack((reconstruction.detach().double().sum(), code_l1.detach().double().sum()))
     rec, norm = (totals / len(signals)).tolist()
@@ -130,7 +134,8 @@ def _make_model(method, dictionary, depth, sparsity, config, l1, weights=None):
 
 
 def main(argv=None):
-    from models import METHODS
+    from models import METHODS, SALISTA
+    from train import MODES, gradient_factors, stages, supported_modes, trainable_parameters
 
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
@@ -143,10 +148,13 @@ def main(argv=None):
         command.add_argument("--batch-size", type=int, default=64)
     fit.add_argument("--l1", type=float, required=True)
     fit.add_argument("--model", choices=METHODS, default="AdaLISTA")
+    fit.add_argument("--mode", choices=MODES, default="end_to_end")
     fit.add_argument("--sparsity", type=int, help="Assumed coefficient sparsity for NA-ALISTA and SALISTA")
     fit.add_argument("--model-config", type=Path, help="JSON model options, including explicit bounds for SALISTA")
     fit.add_argument("--depth", type=int, default=16)
-    fit.add_argument("--epochs", type=int, default=100)
+    fit.add_argument("--epochs", type=int, default=100, help="end-to-end epoch cap")
+    fit.add_argument("--epochs-per-layer", type=int, default=100,
+                     help="layerwise epoch cap per active depth, split across its training phases")
     fit.add_argument("--patience", type=int, default=25)
     fit.add_argument("--lr", type=float, default=1e-3)
     fit.add_argument("--seed", type=int, default=20261118)
@@ -170,6 +178,10 @@ def main(argv=None):
 
     if min(args.epochs, args.patience, args.depth) < 1 or not math.isfinite(args.lr) or args.lr <= 0:
         parser.error("epochs, patience, depth and learning rate must be positive")
+    if args.epochs_per_layer < 3:
+        parser.error("epochs-per-layer must be at least 3 to allocate the three training phases")
+    if args.mode not in supported_modes(args.model):
+        parser.error(f"{args.model} supports only {', '.join(supported_modes(args.model))} training")
     if not math.isfinite(args.l1) or args.l1 < 0:
         parser.error("l1 must be finite and nonnegative")
     if not 0 <= args.seed < 2**32:
@@ -192,28 +204,63 @@ def main(argv=None):
     model = _make_model(args.model, initial, args.depth, args.sparsity, config, args.l1).to(args.device)
     if args.model == "NA-ALISTA":
         model.calibrate(training[0][:args.batch_size].to(args.device))
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    schedule = dict(depth=args.depth, max_epochs_end_to_end=args.epochs,
+                    max_epochs_per_layer=args.epochs_per_layer, early_stopping_patience=args.patience,
+                    learning_rate=args.lr, layerwise_learning_rate=args.lr, recurrent_learning_rate=args.lr,
+                    salista=config.get("salista", {}))
+    plan = stages(args.mode, schedule, args.model)
+    shared_controller = isinstance(model, SALISTA) and model.sharing == "shared"
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    best, wait = math.inf, 0
+    records = []
+    epoch = updates = best_epoch = 0
+    updates_per_epoch = math.ceil(len(training[0]) / args.batch_size)
     with TemporaryDirectory(dir=args.checkpoint.parent) as staging:
-        for epoch in range(1, args.epochs + 1):
-            train_score = sparse_coding_epoch(model, *training, args.depth, args.l1, batch_size=args.batch_size,
-                                              optimizer=optimizer, generator=generator)
-            val = sparse_coding_epoch(model, *validation, args.depth, args.l1, batch_size=args.batch_size)
-            print(json.dumps(dict(epoch=epoch, train_objective=train_score["objective"],
-                                  val_objective=val["objective"]), allow_nan=False), flush=True)
-            if val["objective"] < best:
-                best, wait = val["objective"], 0
-                tmp = Path(staging) / "best.pt"
-                torch.save(dict(method=args.model, depth=args.depth, l1=args.l1, epoch=epoch,
-                                seed=args.seed, val_objective=best, batch_size=args.batch_size,
-                                lr=args.lr, patience=args.patience, sparsity=args.sparsity,
-                                model_config=config, weights=model.state_dict()), tmp)
-                tmp.replace(args.checkpoint)
-            else:
-                wait += 1
+        stage_best = Path(staging) / "stage.pt"
+        pending = Path(staging) / "publish.pt"
+
+        def publish_full_depth(score, complete):
+            torch.save(dict(method=args.model, mode=args.mode, depth=args.depth, l1=args.l1, epoch=best_epoch,
+                            epochs=epoch, updates=updates, seed=args.seed, val_objective=score,
+                            batch_size=args.batch_size, lr=args.lr, patience=args.patience,
+                            max_epochs_end_to_end=args.epochs, max_epochs_per_layer=args.epochs_per_layer,
+                            sparsity=args.sparsity, stages=records, training_complete=complete,
+                            model_config=config, weights=model.state_dict()), pending)
+            pending.replace(args.checkpoint)
+
+        for phase in plan:
+            params = trainable_parameters(model, phase.name, phase.depth)
+            optimizer = torch.optim.Adam(params.values(), lr=phase.lr)
+            # Shared SALISTA updates the same controller through every step in its active prefix.
+            multipliers = () if shared_controller else gradient_factors(params, phase, 0.3)
+            # A lower-rate fine-tune must compete with the incoming best weights at the same depth.
+            best = records[-1]["best_val_objective"] if phase.name.startswith("joint_") else math.inf
+            wait, stop_reason = 0, "epoch_limit"
+            for stage_epoch in range(1, phase.epochs + 1):
+                train_score = sparse_coding_epoch(model, *training, phase.depth, args.l1,
+                                                  batch_size=args.batch_size, optimizer=optimizer,
+                                                  generator=generator, last_step_grad=phase.name == "new_layer",
+                                                  gradient_multipliers=multipliers)
+                val = sparse_coding_epoch(model, *validation, phase.depth, args.l1, batch_size=args.batch_size)
+                epoch += 1
+                updates += updates_per_epoch
+                if val["objective"] < best:
+                    best, best_epoch, wait = val["objective"], epoch, 0
+                    torch.save(model.state_dict(), stage_best)
+                    if phase.depth == args.depth:
+                        publish_full_depth(best, complete=False)
+                else:
+                    wait += 1
+                print(json.dumps(dict(epoch=epoch, updates=updates, active_depth=phase.depth, phase=phase.name,
+                                      stage_epoch=stage_epoch, train_objective=train_score["objective"],
+                                      val_objective=val["objective"]), allow_nan=False), flush=True)
                 if wait >= args.patience:
+                    stop_reason = "validation_patience"
                     break
+            model.load_state_dict(torch.load(stage_best, map_location=args.device, weights_only=True))
+            records.append(dict(depth=phase.depth, phase=phase.name, learning_rate=phase.lr,
+                                epoch_cap=phase.epochs, epochs_run=stage_epoch, updates=stage_epoch * updates_per_epoch,
+                                best_epoch=best_epoch, best_val_objective=best, stop_reason=stop_reason))
+        publish_full_depth(best, complete=True)
 
 
 if __name__ == "__main__":

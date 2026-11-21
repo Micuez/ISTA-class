@@ -48,6 +48,17 @@ python sparse_coding.py train --model AdaLISTA --data coding.npz --checkpoint ru
 python sparse_coding.py test --data coding.npz --checkpoint runs/coding.pt
 ```
 
+稀疏编码训练支持 `--mode end_to_end` 和 `--mode layerwise`。NA-ALISTA 使用端到端。每个日程按验证集的平均 LASSO 目标选择权重。端到端最多 100 轮；逐层每个深度最多 100 轮，深度 16 时累计上限为 1,600 轮。各阶段的默认早停耐心为 25。逐层与端到端有不同的预算，检查点记录实际训练轮数和更新次数。
+
+20 dB 稀疏编码对照使用项目的固定训练集、验证集和测试集，分别为 10,000、1,000 和 2,000 条观测。七种方法中，SALISTA 分有界和自由动量，各跑两种日程，合计 15 组。以下命令从仓库根目录执行。加 `--dry-run` 可只查看任务和设备分配。
+
+```bash
+python -u run_sparse_coding_grid.py --data-main data/main --snr 20 --seed 20261118 \
+  --out runs/coding-20dB-seed-20261118 --gpus 0 1 2 3 4 5 6 7 8 9 --simultaneous
+```
+
+这次配置固定深度 16、λ 为 0.1、batch 为 64、Adam 起始学习率为 0.001。四个 SALISTA 任务各自独占一张 GPU，其他任务分配到剩余六张卡。训练日志和状态位于输出目录的 `<变体>/<日程>/` 内。每组训练成功后评测其最佳全深度检查点，写入 `test.json`。全部任务退出后，`summary.json` 汇总测试分数及更新数，`salista_momentum_comparison.json` 按训练日程给出自由动量减去有界动量的测试目标差值，负数表示自由动量的目标更低。重做整组实验时指定新的输出目录。
+
 同一字典下可将训练命令的模型改为 `--model SALISTA --sparsity 4 --model-config coding-salista.json`。稀疏度是调用方提供的模型先验。一个显式半径配置示例如下，实际数值应按数据设定。软件记录的编码目标值衡量重建和稀疏性的折中。
 
 ```json
