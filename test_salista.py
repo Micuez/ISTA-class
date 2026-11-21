@@ -221,7 +221,7 @@ class SALISTATests(unittest.TestCase):
         self.assertFalse(torch.allclose(bound_trace[0]["theta"], free_trace[0]["theta"]))
         self.assertGreater(free_trace[0]["theta"].sum().item(), (free.eta * free_trace[0]["budget"]).sum().item())
         self.assertTrue(torch.equal(free_trace[0]["threshold_scale"], torch.ones(len(y), 1)))
-        self.assertTrue(free_trace[0]["support_certified"].all())
+        self.assertFalse(free_trace[0]["support_certified"].any())
         self.assertTrue(torch.isfinite(prediction).all())
         prediction.square().mean().backward()
         self.assertGreater(free.layers[0].threshold.weight.grad.abs().sum().item(), 0.)
@@ -246,6 +246,37 @@ class SALISTATests(unittest.TestCase):
         self.assertLess(tiny[0]["gamma"].max().item(), 0.5)
         with self.assertRaisesRegex(ValueError, "free_step"):
             SALISTA(A, A, 1, 1, initial_l1_bound=1., noise_l2_bound=0., free_step=1)
+
+    def test_free_signed_momentum_and_budget(self):
+        A = torch.eye(2)
+        settings = dict(initial_l1_bound=1., noise_l2_bound=0., gamma_min=.5,
+                        gamma_max=.5, eta=0., beta_max=.2)
+        bounded = SALISTA(A, A, 1, 3, **settings)
+        free = SALISTA(A, A, 1, 3, free_momentum=True, **settings)
+        free.load_state_dict(bounded.state_dict())
+        y = torch.tensor([[1., 0.], [0., -.5]])
+        for value in (-1.2, 1.25):
+            with torch.no_grad():
+                free.layers[0].momentum.weight.zero_()
+                free.layers[0].momentum.bias.fill_(value)
+            bounded.load_state_dict(free.state_dict())
+            path, trace = free(y, 3, return_path=True, return_diagnostics=True)
+            _, capped = bounded(y, 3, return_diagnostics=True)
+            self.assertEqual(trace[0]["beta"].count_nonzero().item(), 0)
+            self.assertTrue(((capped[1]["beta"] >= 0) & (capped[1]["beta"] <= .2)).all())
+            torch.testing.assert_close(trace[1]["beta"], torch.full_like(y, value))
+            expected = path[0] + .5 * (y - path[0]) + value * path[0]
+            torch.testing.assert_close(path[1], expected)
+            for estimate, step in zip(path, trace):
+                self.assertTrue(((estimate - y).abs().sum(1, keepdim=True) <= step["next_budget"] + 1e-6).all())
+            rec = free.certificate.next_budget(trace[1]["gamma"], trace[1]["budget"], trace[0]["budget"],
+                                               0., 0., abs(value))
+            torch.testing.assert_close(trace[1]["next_budget"], torch.minimum(rec, 1 + path[1].abs().sum(1, keepdim=True)))
+            free.zero_grad()
+            path[1].sum().backward()
+            self.assertGreater(free.layers[0].momentum.bias.grad.abs().item(), 0.)
+        with self.assertRaisesRegex(ValueError, "free_momentum"):
+            SALISTA(A, A, 1, 2, free_momentum=1, **settings)
 
     def test_production_trainer_and_checkpoint(self):
         cfg = json.loads(Path(__file__).with_name("training.salista.json").read_text())

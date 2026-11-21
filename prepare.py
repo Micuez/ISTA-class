@@ -44,10 +44,12 @@ def prepare(method, checkout=None):
                                stdout=stream, check=True)
         # This is an exported tree inside a parent Git repo. Apply only within the export.
         env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(tmp))
-        patch = str(BASE / "patches" / (spec.get("patch", method) + ".patch"))
-        apply = ["git", "apply", "--no-index", "--ignore-space-change"]
-        subprocess.run(apply + ["--check", patch], cwd=staged, env=env, check=True)
-        subprocess.run(apply + [patch], cwd=staged, env=env, check=True)
+        patch_name = spec.get("patch", method)
+        if patch_name is not None:
+            patch = str(BASE / "patches" / (patch_name + ".patch"))
+            apply = ["git", "apply", "--no-index", "--ignore-space-change"]
+            subprocess.run(apply + ["--check", patch], cwd=staged, env=env, check=True)
+            subprocess.run(apply + [patch], cwd=staged, env=env, check=True)
         (staged / "UPSTREAM_COMMIT").write_text(spec["commit"] + "\n", encoding="ascii")
         staged.rename(dest)
     print(dest)

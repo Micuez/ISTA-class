@@ -32,5 +32,14 @@
     "commit": "40597f05e3ef179e4ae44173d25674640db7d27a",
     "code_dir": ".",
     "model": "NA_ALISTA_UR_128"
+  },
+  "AdaLISTA": {
+    "url": "https://github.com/aaberdam/AdaLISTA.git",
+    "commit": "984411e46a8c3af3eb90f2d66b4d225088a87aa4",
+    "code_dir": ".",
+    "source_file": "models.py",
+    "model": "Adaptive_ISTA",
+    "patch": null,
+    "paper": "https://arxiv.org/abs/2001.08456"
   }
 }

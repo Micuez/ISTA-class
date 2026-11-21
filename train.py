@@ -22,7 +22,7 @@ from na_training import author_batches, author_holdout_score, paired_author_batc
 BASE = Path(__file__).resolve().parent
 MODES = ("end_to_end", "layerwise")
 DEFAULT_RUNS = Path("runs/single-snr-finetuned")
-EVALUATION_FILES = ("dataset.py", "models.py", "evaluation.py", "salista_constraints.py")
+EVALUATION_FILES = ("dataset.py", "models.py", "evaluation.py", "salista_constraints.py", "adalista_model.py")
 # The initial release recorded only a full trainer hash. Its prediction and
 # scoring routines are identical to the evaluation revision recorded here.
 LEGACY_EVALUATORS = {
@@ -32,11 +32,11 @@ LEGACY_EVALUATORS = {
 # Baseline predictions and metrics from the two pre-SALISTA evaluation revisions.
 BASELINE_EVALUATORS = {"e33783d3a46b7c21b13489d2ddc28847965e31e4967e524fa95eb716a3780fa7",
                        "9ed6583231e2398f4b36745b1827acef80ced153bf068049f52a04ed60d3a8b5"}
-# Checkpoints started before later SALISTA ablations. Their stored weights
-# still use the unchanged equations for every other method.
+# Existing recovery models retain their prediction equations for these revisions.
 ACCEPTED_EVALUATION_REVISIONS = {
     "6d0205f08f8deda1ed165792a58d2dab150e8e16370b633846f8c92f8aa32387",
     "748748fba783c794659cf185dd6f8db06032f6873e6aa53b7db6cbb990178dec",
+    "937cd132068b4168f0647ab7ec53c4ca2025ede51ca69343c70464b247f0aa51",  # 563acd4
 }
 
 
@@ -59,12 +59,12 @@ class Phase(NamedTuple):
     lr: float
 
 
-def supported_modes(method, na_shared_prefix=False):
-    return ("end_to_end",) if method == "NA-ALISTA" and not na_shared_prefix else MODES
+def supported_modes(method):
+    return ("end_to_end",) if method == "NA-ALISTA" else MODES
 
 
 def stages(mode, config, method="ALISTA"):
-    allowed = supported_modes(method, config.get("na_shared_prefix", False))
+    allowed = supported_modes(method)
     if mode not in allowed:
         raise ValueError(f"{method} supports {', '.join(allowed)} for this configuration")
     depth = config["depth"]
@@ -82,11 +82,10 @@ def stages(mode, config, method="ALISTA"):
         schedule = config.get("na_schedule", "experiment")
         if schedule not in ("experiment", "author"):
             raise ValueError("Unknown NA-ALISTA schedule: " + str(schedule))
-        if schedule == "author" and (mode == "layerwise" or config.get("paired_author_online")):
+        if schedule == "author" and config.get("paired_author_online"):
             raise ValueError("The author schedule uses its original end-to-end protocol")
-        if mode == "end_to_end":
-            cap = 100 + 20 * depth if schedule == "author" else end_cap
-            return [Phase(depth, "end_to_end", cap, 0.0002 if schedule == "author" or recurrent_lr is None else recurrent_lr)]
+        cap = 100 + 20 * depth if schedule == "author" else end_cap
+        return [Phase(depth, "end_to_end", cap, 0.0002 if schedule == "author" or recurrent_lr is None else recurrent_lr)]
     if mode == "end_to_end":
         return [Phase(depth, mode, end_cap, config["learning_rate"] if recurrent_lr is None else recurrent_lr)]
     factors = config.get("finetune_lr_factors", [0.2, 0.02])
@@ -96,8 +95,7 @@ def stages(mode, config, method="ALISTA"):
     if not math.isfinite(base) or base <= 0:
         raise ValueError("layerwise_learning_rate must be finite and positive")
     quotient, remainder = divmod(layer_cap, 3)
-    shared_prefix = method == "NA-ALISTA" or (method == "SALISTA" and
-                    config.get("salista", {}).get("sharing", "shared") == "shared")
+    shared_prefix = method == "SALISTA" and config.get("salista", {}).get("sharing", "shared") == "shared"
     plan = []
     for active in range(1, depth + 1):
         if shared_prefix and active < depth:
@@ -131,13 +129,11 @@ def restore_levels(data, previous):
 
 
 def trainable_parameters(model, phase, depth):
+    if isinstance(model, NeuralALISTA) and phase != "end_to_end":
+        raise ValueError("NA-ALISTA supports end_to_end training only")
     model.requires_grad_(phase == "end_to_end")
     if phase != "end_to_end":
-        if isinstance(model, NeuralALISTA):
-            if phase not in ("prefix", "joint_1", "joint_2"):
-                raise ValueError("Shared NA-ALISTA uses full prefix backpropagation")
-            model.regressor.requires_grad_(True)
-        elif phase == "prefix" and isinstance(model, SALISTA) and model.sharing == "shared":
+        if phase == "prefix" and isinstance(model, SALISTA) and model.sharing == "shared":
             model.stage_module(depth).requires_grad_(True)
         elif phase == "new_layer":
             if isinstance(model, SALISTA) and model.sharing == "shared":
@@ -148,8 +144,10 @@ def trainable_parameters(model, phase, depth):
                 layer.requires_grad_(True)
         else:
             raise ValueError("Unknown training phase: " + phase)
-        if getattr(model, "shared_weight", None) is not None:
-            model.shared_weight.requires_grad_(phase != "new_layer" or depth == 1)
+        for name in ("shared_weight", "shared_matrices"):
+            shared = getattr(model, name, None)
+            if shared is not None:
+                shared.requires_grad_(phase != "new_layer" or depth == 1)
     return {name: p for name, p in model.named_parameters() if p.requires_grad}
 
 
@@ -159,7 +157,7 @@ def gradient_factors(params, phase, decay):
         return []
     factors = []
     for name, parameter in params.items():
-        first_depth = 1 if name == "shared_weight" else int(name.split(".")[1]) + 1
+        first_depth = int(name.split(".")[1]) + 1 if name.startswith("layers.") else 1
         factors.append((parameter, decay ** (phase.depth - first_depth)))
     return factors
 
@@ -213,7 +211,7 @@ def _fit(data, method, mode, config, device, dest, fingerprint):
             holdout = sparse_signals(10000, data.A.shape[1], data.config["nonzeros"])
     model = build_model(method, data, depth, config).to(device)
     shared_controller = is_na or (isinstance(model, SALISTA) and model.sharing == "shared")
-    tf_layerwise_loss = mode == "layerwise" and method not in ("NA-ALISTA", "SALISTA")
+    tf_layerwise_loss = mode == "layerwise" and method in ("ALISTA", "ELISTA", "EBT-LISTA", "HLISTA")
     dest.parent.mkdir(parents=True, exist_ok=True)
     global_epoch, total_updates = 0, 0
     stage_records = []
@@ -315,8 +313,8 @@ def load_checkpoint(data, path, device, fingerprint):
     # Earlier checkpoints use the same trained-weight forward equations.
     known_baseline = run["method"] in BASELINE_METHODS and signature in BASELINE_EVALUATORS
     current_evaluation = implementation_sha256(EVALUATION_FILES)
-    if (signature != current_evaluation and signature not in ACCEPTED_EVALUATION_REVISIONS
-            and not known_baseline):
+    known_revision = run["method"] in (*BASELINE_METHODS, "SALISTA") and signature in ACCEPTED_EVALUATION_REVISIONS
+    if signature != current_evaluation and not known_revision and not known_baseline:
         raise ValueError("Use the matching model and evaluation revision for this checkpoint")
     cfg = run["training"]
     model = build_model(run["method"], data, cfg["depth"], cfg).to(device)
@@ -352,6 +350,8 @@ def main():
     parser.add_argument("--snr", type=float, required=True, choices=(40, 20, 10, 5, math.inf))
     parser.add_argument("--na-schedule", choices=("experiment", "author"),
                         help="author uses 100 + 20 * depth epochs and a separate synthetic holdout")
+    parser.add_argument("--salista-momentum", choices=("bounded", "free"),
+                        help="override salista.free_momentum for an explicit SALISTA training run")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
     config_path = args.config or BASE / ("training.salista.json" if args.model == "SALISTA" else "training.json")
@@ -360,6 +360,12 @@ def main():
         cfg["seed"] = args.seed
     if args.na_schedule is not None:
         cfg["na_schedule"] = args.na_schedule
+    if args.salista_momentum is not None:
+        if args.action != "train" or args.model != "SALISTA":
+            parser.error("--salista-momentum applies to 'train --model SALISTA'; test uses the checkpoint settings")
+        if "salista" not in cfg:
+            parser.error("--salista-momentum requires a config with SALISTA settings")
+        cfg["salista"]["free_momentum"] = args.salista_momentum == "free"
     default_methods = METHODS if cfg.get("paired_author_online") and "salista" in cfg else BASELINE_METHODS
     models = default_methods if args.model == "all" else (args.model,)
     modes = MODES if args.mode == "both" else (args.mode,)
@@ -367,7 +373,7 @@ def main():
             and math.isfinite(cfg["learning_rate"]) and cfg["learning_rate"] > 0
             and 0 <= cfg["seed"] < 2**32):
         parser.error("Invalid training configuration")
-    jobs = [(m, mode) for m in models for mode in modes if mode in supported_modes(m, cfg.get("na_shared_prefix", False))]
+    jobs = [(m, mode) for m in models for mode in modes if mode in supported_modes(m)]
     if args.action == "test" and args.model == "NA-ALISTA" and args.mode == "layerwise":
         jobs = [(args.model, args.mode)]  # Evaluation of a historical checkpoint.
     if not jobs:

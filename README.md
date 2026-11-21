@@ -1,29 +1,62 @@
 # 高噪声观测下的稀疏信号恢复
 
-给定已知字典 $A$ 和带噪观测 $y$，估计稀疏信号 $x$。每个 SNR 独立训练、验证和测试。默认的 `baseline` 网格有 45 个任务，覆盖五个基线和含无噪声在内的五档观测。`six-methods` 网格加入 SALISTA，六种方法均覆盖四档有限噪声和两种训练方式。
+仓库提供两个任务。稀疏恢复从带噪观测和已知字典估计生成信号的系数，以真值系数监督训练。稀疏编码给定信号、字典和正则强度，直接最小化 LASSO 目标；AdaLISTA 还可接收每条样本自己的字典。
 
-## 六法对比 · 种子 20261118
+## 稀疏恢复七方法对比
 
 在具备 CUDA 版 PyTorch 2.8 且已有 `data/main` 的机器上，从仓库根目录执行以下命令。首次建立固定数据的命令见本文的“服务器运行”一节。
 
 ```bash
-python run_single_snr_grid.py --preset six-methods --seed 20261118
+python run_single_snr_grid.py --preset seven-methods --seed 20261118
 ```
 
-六种方法为 EBT-LISTA、HLISTA、ALISTA、ELISTA、NA-ALISTA、SALISTA。每种均展开 16 层，各做端到端与逐层训练，在 40、20、10、5 dB 上共保存 **48 份**检查点。`--dry-run` 可预览清单。调度器按可见 GPU 分配任务，每张卡同时运行一个任务。
+在 40、20、10、5 dB 分别训练 16 层模型。NA-ALISTA 只做端到端，其余六种方法均做端到端和逐层，合计 **52 组**。加 `--dry-run` 可预览任务。`baseline` 保留原五基线的 45 组；`six-methods` 选择原六法，按新协议共 44 组。
 
 | 训练组 | 数据和逐层方式 |
 |---|---|
-| NA-ALISTA 与 SALISTA | 两者均按 NA 作者的实数协议在线采样。每轮生成 50,000 条 Bernoulli–Gaussian 信号，batch 512，使用 97 个完整批次。每条干净观测按自身样本标准差加噪。同一设备类型、相同种子和全局 epoch 对应相同信号、顺序与噪声随机流。NA 使用共享 LSTM，SALISTA 使用共享 GRU。逐层对照对当前完整前缀反传，最后两档低学习率联合微调。NA 的逐层日程是本仓库增加的实验条件。 |
-| 其余四法 | 每档固定 10,000 条训练信号，batch 64，每轮 157 次更新。逐层先训练新增参数，再两次微调当前前缀。 |
+| NA-ALISTA 与 SALISTA | 两者均按 NA 作者的实数协议在线采样。每轮生成 50,000 条 Bernoulli–Gaussian 信号，batch 512，使用 97 个完整批次。每条干净观测按自身样本标准差加噪。同一设备类型、相同种子和全局 epoch 对应相同信号、顺序与噪声随机流。NA 使用共享 LSTM，SALISTA 使用共享 GRU。SALISTA 的递增深度训练对当前完整前缀反传，最后两档低学习率联合微调。NA 只训练完整深度。 |
+| 其余五法（含 AdaLISTA） | 每档固定 10,000 条训练信号，batch 64，每轮 157 次更新。逐层先训练新增参数，再两次微调当前前缀。 |
 
-六法共用同一份固定字典、验证集和测试集。按固定验证集线性 NMSE 选权重，每阶段等待 50 个 epoch。两个循环模型在两种日程均从 Adam 学习率 0.0002 起步，SALISTA 保留全零时的阈值缩放。在线训练的概率界同时计入随机支撑大小和随样本变化的噪声标准差。训练样本量、批大小、早停轮数均会影响比较，汇总表包含更新数和含验证的训练耗时。[正式配置](training.comparison.json) · [SALISTA 证书与缩放条件](SALISTA.md)
+七法共用固定字典、验证集和测试集。每阶段按固定验证集线性 NMSE 选权重，连续 25 轮没有严格改善就停止该阶段。两个循环模型均从 Adam 学习率 0.0002 起步。正式 SALISTA 使用自由正阈值、自由正步长和有界动量。在线训练的概率界同时计入随机支撑大小和随样本变化的噪声标准差。训练样本量、批大小、早停轮数均会影响比较，汇总表包含更新数和含验证的训练耗时。[正式配置](training.comparison.json) · [SALISTA 证书与缩放条件](SALISTA.md)
 
-默认输出为 `runs/six-methods-seed-20261118/`。`test_summary_seed_20261118.csv` 每行对应一份最终检查点的测试 NMSE、NMSE（dB）与 top-50 支撑 F1。`fixed_depth_val_nmse.csv` 和 `figures/` 保存同一检查点的验证深度曲线及端到端误差箱线图。可用 `python -m unittest -v test_comparison test_experiment test_salista` 复核运行约定。单种子结果仅描述本次抽样。
+七法默认输出为 `runs/seven-methods-seed-20261118/`。历史六法仍在 `runs/six-methods-seed-20261118/`，新版六法写入 `runs/six-methods-na-e2e-seed-20261118/`。`test_summary_seed_20261118.csv` 每行对应一份最终检查点的测试 NMSE、NMSE（dB）与 top-50 支撑 F1。`fixed_depth_val_nmse.csv` 和 `figures/` 保存同一检查点的验证深度曲线及端到端误差箱线图。可用 `python -m unittest discover -v` 复核运行约定。单种子结果仅描述本次抽样。
 
 SALISTA V3 支持端到端或递增深度训练。主字典在稀疏度 50 时的严格阈值会压零全部首层输出。SALISTA 短配置仅在某条非零更新将被全部压零时等比例降低该样本的阈值。四档训练观测在此配置下首层均产生非零输出，触发后的支撑保证需单独评估。模型、严格对照与复核命令见 [SALISTA 设计与验证记录](SALISTA.md)。
 
 ## 数据协议
+
+### 稀疏编码入口
+
+对信号 $y$、字典 $D$ 和正则强度 λ，训练时最小化每条信号的 `0.5 * ||Dz - y||² + λ * ||z||₁`，验证时按同一目标选择检查点。这个任务无需真实系数。固定字典稀疏恢复的 NMSE 和支撑 F1 单独评估。
+
+准备一个 NPZ，包含 `train_y`、`val_y`、`test_y`，形状分别为 `[N_split,m]`。固定字典使用公共键 `D`，形状为 `[m,n]`。AdaLISTA 也接受 `train_D`、`val_D`、`test_D`，每个形状为 `[m,n]` 或 `[N_split,m,n]`，按行与信号配对。例如，从仓库已有的 20 dB 观测构建一个固定字典编码任务：
+
+```python
+from pathlib import Path
+import numpy as np
+from dataset import RecoveryData
+
+data = RecoveryData(Path("data/main"))
+signals = {f"{split}_y": data.arrays(split, 20)[0] for split in ("train", "val", "test")}
+np.savez("coding.npz", D=data.A, **signals)
+```
+
+以下命令在训练划分上优化并按验证目标选权重，测试时从检查点读取模型与 λ。
+
+```bash
+python sparse_coding.py train --model AdaLISTA --data coding.npz --checkpoint runs/coding.pt --l1 0.1 --depth 16
+python sparse_coding.py test --data coding.npz --checkpoint runs/coding.pt
+```
+
+同一字典下可将训练命令的模型改为 `--model SALISTA --sparsity 4 --model-config coding-salista.json`。稀疏度是调用方提供的模型先验。一个显式半径配置示例如下，实际数值应按数据设定。软件记录的编码目标值衡量重建和稀疏性的折中。
+
+```json
+{"salista": {"bounds": {"mode": "explicit", "initial_l1_bound": 8.0, "noise_l2_bound": 0.1}, "free_threshold": true, "free_step": true, "free_momentum": false}}
+```
+
+AdaLISTA 的两个可学习矩阵在各层共享，作用于输入字典，每一层单独学习步长和收缩尺度。这里使用作者 `Adaptive_ISTA` 的更新和项目自己的训练协议。作者仓库还提供列置换、扰动字典和随机字典实验。[作者实现](https://github.com/aaberdam/AdaLISTA/blob/984411e46a8c3af3eb90f2d66b4d225088a87aa4/models.py#L12-L49) · [编码任务入口](sparse_coding.py)
+
+### 固定字典稀疏恢复
 
 | 项目 | 首版值 |
 |---|---|
@@ -52,7 +85,7 @@ $$
 
 实测值按整个测试集的信号总能量除以噪声总能量，再取 $10\log_{10}$。[数据配置](experiment.json) · [生成器](generate.py) · [独立核验](verify_data.py)
 
-ALISTA、HLISTA 和 EBT-LISTA 的原始稀疏编码入口按每条干净观测的中心化标准差设置噪声。NA-ALISTA 的原始实现调用 `torch.std(y, dim=1)`。五个方法共用上述固定验证、测试观测。EBT-LISTA、HLISTA、ALISTA、ELISTA 也用同一套固定训练数据。NA-ALISTA 训练按作者协议在线抽样，细节见下文。不同论文里的同名 SNR 不能直接当成本实验的恢复成绩。[ALISTA 噪声](https://github.com/VITA-Group/ALISTA/blob/23f3637f01066a919d37af76fd60ee03d33188b9/utils/train.py#L79-L99) · [HLISTA 噪声](https://github.com/ZhengZY-EE/Hybrid_ISTA/blob/ddde3c5867bfb453741d0c2e2cca507e6070994a/utils/train.py#L82-L103) · [EBT-LISTA 噪声](https://github.com/lzalza/EBT-LISTA/blob/efe0a317578f47b2ea8defed0fc04cc0044f03f3/code/utils/train.py#L135-L157) · [NA-ALISTA 噪声](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/utils/noise.py#L10-L22)
+ALISTA、HLISTA 和 EBT-LISTA 的原始稀疏编码入口按每条干净观测的中心化标准差设置噪声。NA-ALISTA 的原始实现调用 `torch.std(y, dim=1)`。正式恢复对照共用上述固定验证、测试观测。EBT-LISTA、HLISTA、ALISTA、ELISTA、AdaLISTA 也用同一套固定训练数据。NA-ALISTA 训练按作者协议在线抽样，细节见下文。不同论文里的同名 SNR 不能直接当成本实验的恢复成绩。[ALISTA 噪声](https://github.com/VITA-Group/ALISTA/blob/23f3637f01066a919d37af76fd60ee03d33188b9/utils/train.py#L79-L99) · [HLISTA 噪声](https://github.com/ZhengZY-EE/Hybrid_ISTA/blob/ddde3c5867bfb453741d0c2e2cca507e6070994a/utils/train.py#L82-L103) · [EBT-LISTA 噪声](https://github.com/lzalza/EBT-LISTA/blob/efe0a317578f47b2ea8defed0fc04cc0044f03f3/code/utils/train.py#L135-L157) · [NA-ALISTA 噪声](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/utils/noise.py#L10-L22)
 
 ## 基线
 
@@ -63,6 +96,9 @@ ALISTA、HLISTA 和 EBT-LISTA 的原始稀疏编码入口按每条干净观测�
 | ALISTA | 解析矩阵 $W$，逐层学习步长和阈值。支持选择每层增加 1.2%，上限 13% | [ALISTA.inference](https://github.com/VITA-Group/ALISTA/blob/23f3637f01066a919d37af76fd60ee03d33188b9/models/ALISTA.py#L86-L106) |
 | NA-ALISTA | `NA_ALISTA_UR_128`，用两个残差特征及跨层共享的 128 维 LSTM 预测每条样本的步长和阈值。支持选择沿用作者的整数序列 | [模型](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/utils/algorithms.py#L125-L174) · [参数序列](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/run.py#L44-L56) |
 | ELISTA | 论文主模型，共享可学习矩阵、两次外梯度更新及多阶段阈值 | [论文公式（8）](https://doi.org/10.1609/aaai.v35i10.17032) · [Hybrid ISTA 的参考实现](https://github.com/ZhengZY-EE/Hybrid_ISTA/blob/ddde3c5867bfb453741d0c2e2cca507e6070994a/models/ELISTA.py#L149-L158) |
+| AdaLISTA | 观测空间内的两个可训练矩阵跨层共享，各层单独学习步长和阈值尺度。输入可显式提供字典 | [作者 Adaptive_ISTA](https://github.com/aaberdam/AdaLISTA/blob/984411e46a8c3af3eb90f2d66b4d225088a87aa4/models.py#L12-L49) |
+
+本项目按实际收缩次数计深度，16 层对应作者的 `T=15`。默认 `adalista.initial_step=null` 按参考字典的谱范数平方倒数初始化步长与阈值尺度。设为 `1.0` 可复现作者合成实验入口的初始化。每样本换字典时仍使用已训练的参数。作者实验用系数标签训练；本项目的无标签 LASSO 接口直接优化编码目标。[作者训练入口](https://github.com/aaberdam/AdaLISTA/blob/984411e46a8c3af3eb90f2d66b4d225088a87aa4/training.py#L188-L209)
 
 ALISTA 与 NA-ALISTA 使用从当前 $A$ 求出的 $W$。设 $V=(AA^\top)^{-1}A$，第 $j$ 列取 $w_j=v_j/(a_j^\top v_j)$。在 $A$ 满行秩时，这是约束 $\operatorname{diag}(W^\top A)=1$ 下最小化 $\|W^\top A\|_F^2$ 的解。实现用线性方程求解，以 float64 计算 $W$，再保存为 float32。[ALISTA 原目标](https://github.com/VITA-Group/ALISTA/blob/23f3637f01066a919d37af76fd60ee03d33188b9/matlabs/CalculateW.m#L1-L6) · [NA-ALISTA 原目标](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/utils/optimize_matrices.py#L44-L70)
 
@@ -74,9 +110,9 @@ HLISTA 有一处影响批处理的移植修正。作者将卷积输出从 `[batc
 
 | 方法与模式 | 参数更新 | 正式预算 |
 |---|---|---|
-| EBT-LISTA、HLISTA、ALISTA、ELISTA 逐层 | 进入每个深度时先训练新增参数，再对第 1 层至当前层的全部可训练参数联合微调两次。三个子阶段的 Adam 学习率依次为 $5\times10^{-4}$、$10^{-4}$、$10^{-5}$ | 每层三个子阶段**合计最多 1,000 轮**，等分上限为 334、333、333 轮。每个子阶段分别使用 50 轮早停 |
-| 上述四个方法端到端 | 从第 16 层的恢复误差向整个模型反传，Adam 学习率 $10^{-3}$ | 最多 100,000 轮，连续 50 轮无改善即停 |
-| NA-ALISTA 端到端 | 同一个 128 维 LSTM 展开 16 步，全程反传。Adam 学习率 $2\times10^{-4}$、batch 512、梯度范数上限 1，首个带噪训练批拟合标准化统计 | 默认与本实验一致，最多 100,000 轮，50 轮早停。可单独选择下述作者轮数 |
+| EBT-LISTA、HLISTA、ALISTA、ELISTA 逐层 | 进入每个深度时先训练新增参数，再对第 1 层至当前层的全部可训练参数联合微调两次。三个子阶段的 Adam 学习率依次为 $5\times10^{-4}$、$10^{-4}$、$10^{-5}$ | 每层三个子阶段**合计最多 1,000 轮**，等分上限为 334、333、333 轮。每个子阶段分别使用 25 轮早停 |
+| 上述四个方法端到端 | 从第 16 层的恢复误差向整个模型反传，Adam 学习率 $10^{-3}$ | 最多 100,000 轮，连续 25 轮无改善即停 |
+| NA-ALISTA 端到端 | 同一个 128 维 LSTM 展开 16 步，全程反传。Adam 学习率 $2\times10^{-4}$、batch 512、梯度范数上限 1，首个带噪训练批拟合标准化统计 | 默认与本实验一致，最多 100,000 轮，25 轮早停。可单独选择下述作者轮数 |
 
 四个逐层模型的预训练仅更新首次引入的参数。ELISTA 的共享矩阵在第一层引入，之后每次联合微调都重新开放。两次微调均按作者代码在 Adam 更新前将参数梯度乘以 $0.3^{t-j}$，其中 $t$ 为当前深度、$j$ 为参数首次出现的层数。逐层损失为总平方误差的一半，沿用 TensorFlow 的 `l2_loss` 定义。四个端到端模型以均方误差训练，梯度范数上限为 1。固定训练集每档 10,000 条、batch 64，每轮 157 次更新。[ALISTA 分阶段训练](https://github.com/VITA-Group/ALISTA/blob/23f3637f01066a919d37af76fd60ee03d33188b9/utils/train.py#L201-L237) · [梯度缩放](https://github.com/VITA-Group/ALISTA/blob/23f3637f01066a919d37af76fd60ee03d33188b9/utils/train.py#L415-L436)
 
@@ -86,7 +122,7 @@ HLISTA 有一处影响批处理的移植修正。作者将卷积输出从 `[batc
 
 两种设置都按作者的实数合成任务训练。每轮重新生成 50,000 个 Bernoulli–Gaussian 信号，各位置以 $k/n$ 的概率非零，非零幅值服从标准正态。打乱后取 97 个完整的 512 样本批次。对每条 $Ax$，按其样本标准差乘 $10^{-r/20}$ 生成新高斯噪声。无噪声档直接使用 $Ax$。这个训练分布和固定训练集的“恰好 50 个非零、每档噪声方差固定”有差别。各方法的公共验证图与最终测试仍使用相同的存储观测。[作者采样](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/utils/get_data.py#L54-L77) · [作者噪声](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/utils/noise.py#L14-L22)
 
-默认 `--na-schedule experiment` 用固定公共验证集选权重和执行 50 轮早停。`--na-schedule author` 按 $100+20T$ 轮训练，16 层共 420 轮、40,740 次更新。每轮在单独生成的 10,000 条固定干净信号上重新加噪，取完整批次按作者指标选权重，跑满预算。这个内部留出集与项目的测试集独立。两个设置都使用本实验提供的 $A,W$。作者脚本列出的 20 和 40 dB 已扩展为本实验的五档。[作者训练入口](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/run.py#L39-L76) · [训练及选权](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/utils/train_utils.py#L18-L72)
+默认 `--na-schedule experiment` 用固定公共验证集选权重和执行 25 轮早停。`--na-schedule author` 按 $100+20T$ 轮训练，16 层共 420 轮、40,740 次更新。每轮在单独生成的 10,000 条固定干净信号上重新加噪，取完整批次按作者指标选权重，跑满预算。这个内部留出集与项目的测试集独立。两个设置都使用本实验提供的 $A,W$。作者脚本列出的 20 和 40 dB 已扩展为本实验的五档。[作者训练入口](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/run.py#L39-L76) · [训练及选权](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/utils/train_utils.py#L18-L72)
 
 ### ELISTA 主模型
 
@@ -101,7 +137,7 @@ $$
 
 公式（6）的多阶段阈值 MT 逐坐标作用。在 $0\le a<b$ 时，幅值小于等于 $a$ 的分量置零，大于等于 $b$ 的保留原值，中间区间线性连接。公开 TensorFlow 参考来自 Hybrid ISTA 作者团队，尚未核实 Li 等本人发布的仓库。本实现依其初始化取 $L=1.001\|A\|_2^2$、$B=A^\top/L$、两步长为 1、两对原始阈值均为 $(0.4/L-0.1,0.4/L)$。代码按行存放样本，保存的是 $B^\top$。优化时对阈值的绝对值排序，并在二者相等时使用硬阈值，避免除零。独立 NumPy 测试按两条公式核对每层输出。[矩阵与阈值初始化](https://github.com/ZhengZY-EE/Hybrid_ISTA/blob/ddde3c5867bfb453741d0c2e2cca507e6070994a/models/ELISTA.py#L28-L120) · [参考阈值函数](https://github.com/ZhengZY-EE/Hybrid_ISTA/blob/ddde3c5867bfb453741d0c2e2cca507e6070994a/utils/tf.py#L126-L136)
 
-Li 等的补充材料给出逐层训练的 batch 64、Adam、基础学习率 $5\times10^{-4}$。验证损失连续 4,000 次迭代未下降时调低学习率，学习率降至 $10^{-5}$ 后若仍无改善则结束该层。本实验沿用逐层训练和学习率范围，按上述每阶段 50 个 epoch 的规则选权重。全深度端到端是本项目增加的对照条件。[作者补充材料 S1](https://zhouchenlin.github.io/Publications/2021-AAAI-ELISTA_supp.pdf)
+Li 等的补充材料给出逐层训练的 batch 64、Adam、基础学习率 $5\times10^{-4}$。验证损失连续 4,000 次迭代未下降时调低学习率，学习率降至 $10^{-5}$ 后若仍无改善则结束该层。本实验沿用逐层训练和学习率范围，按上述每阶段 25 个 epoch 的规则选权重。全深度端到端是本项目增加的对照条件。[作者补充材料 S1](https://zhouchenlin.github.io/Publications/2021-AAAI-ELISTA_supp.pdf)
 
 ### 作者代码和旧仓库怎样计数
 
@@ -112,7 +148,7 @@ Li 等的补充材料给出逐层训练的 batch 64、Adam、基础学习率 $5\
 | EBT-LISTA 与 HLISTA | 作者稀疏恢复入口也有 `maxit=200000` 的单阶段更新上限、每 10 步验证和默认 4,000 步等待期。 [EBT-LISTA 配置](https://github.com/lzalza/EBT-LISTA/blob/efe0a317578f47b2ea8defed0fc04cc0044f03f3/code/config.py#L197-L210) · [HLISTA 配置](https://github.com/ZhengZY-EE/Hybrid_ISTA/blob/ddde3c5867bfb453741d0c2e2cca507e6070994a/config.py#L164-L177) |
 | NA-ALISTA | 作者固定 16 层时用 `100 + 20 × 16 = 420` 个 epoch。每轮生成一组训练信号，50,000 条、batch 512、丢弃尾批，每轮 97 次更新，共 40,740 次。20 和 40 dB 分别训练，两个公开日志各有 420 轮记录。 [训练脚本](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/run.py#L44-L55) · [数据加载](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/utils/get_data.py#L65-L77) · [20 dB 日志](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/res/models/model=NA_ALISTA_UR_128__m=250__s=50__k=16__noise=GaussianNoise20__n=500/train_log#L419-L421) · [40 dB 日志](https://github.com/feeds/na-alista/blob/40597f05e3ef179e4ae44173d25674640db7d27a/res/models/model=NA_ALISTA_UR_128__m=250__s=50__k=16__noise=GaussianNoise40__n=500/train_log#L419-L421) |
 
-上一轮服务器的单档结果记在 [实验报告](experiment_report.md)。该报告对应先前的贪心逐层训练与 5 轮早停。 [早期混合数据首层检查](results/first-layer-budget.csv) 仅用于追溯旧协议。
+上一轮服务器的单档结果记在 [实验报告](experiment_report.md)。报告分别记录了早期四法的 5 轮早停和种子 20261118 的六法历史实验（50 轮早停，含 NA 递增深度）。 [早期混合数据首层检查](results/first-layer-budget.csv) 仅用于追溯旧协议。
 
 ## 服务器运行
 
@@ -133,6 +169,7 @@ python train.py train --model ELISTA --mode layerwise --snr 5
 python train.py train --model ELISTA --mode end_to_end --snr 5
 python train.py test --model ELISTA --mode layerwise --snr 5
 python train.py train --model NA-ALISTA --mode end_to_end --snr 20 --na-schedule author --out runs/na-author
+python train.py train --model SALISTA --mode layerwise --snr 20 --config training.comparison.json --salista-momentum free --out runs/salista-free-momentum
 ```
 
 独立生成无噪声数据可运行 `python generate.py --noiseless-from data/main --out data/noiseless`。GPU 网格遵守 `CUDA_VISIBLE_DEVICES`。单机 CPU 可加 `--device cpu`。小规模检查可使用 [快速配置](training.quick.json)。

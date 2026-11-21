@@ -22,7 +22,7 @@ from verify_data import check_paired_signals
 
 SNRS = (40, 20, 10, 5, float("inf"))
 COLORS = {"EBT-LISTA": "#0072B2", "HLISTA": "#D98600", "ALISTA": "#008364",
-          "ELISTA": "#7656A4", "NA-ALISTA": "#C45112", "SALISTA": "#394D67"}
+          "ELISTA": "#7656A4", "NA-ALISTA": "#C45112", "SALISTA": "#394D67", "AdaLISTA": "#AC4787"}
 
 
 @torch.inference_mode()
@@ -159,7 +159,8 @@ def main():
         level = matched_level(data, snr)
         for method in args.methods:
             for mode in args.modes:
-                if mode not in supported_modes(method, args.include_na_layerwise):
+                historical_na = args.include_na_layerwise and method == "NA-ALISTA" and mode == "layerwise"
+                if mode not in supported_modes(method) and not historical_na:
                     continue
                 path = args.runs / method / mode / ("snr-" + key) / f"seed-{args.seed}"
                 run, model = load_checkpoint(data, path, device, fingerprint)

@@ -7,12 +7,13 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from adalista_model import AdaLISTA
 from generate import analytic_weights
 from salista_constraints import RecoveryCertificate, project_threshold_budget, rescale_stalled_threshold, recovery_prior
 
 
 BASELINE_METHODS = ("EBT-LISTA", "HLISTA", "ALISTA", "ELISTA", "NA-ALISTA")
-METHODS = BASELINE_METHODS + ("SALISTA",)
+METHODS = BASELINE_METHODS + ("SALISTA", "AdaLISTA")
 
 
 def scalar(value):
@@ -233,7 +234,7 @@ class SALISTA(nn.Module):
     def __init__(self, A, W, sparsity, depth, *, initial_l1_bound, noise_l2_bound,
                  cell="gru", sharing="shared", hidden_size=32, gamma_min=0.5,
                  gamma_max=1.1, beta_max=0.2, eta=0.05, stall_threshold_ratio=None,
-                 free_threshold=False, free_step=False):
+                 free_threshold=False, free_step=False, free_momentum=False):
         super().__init__()
         if A.ndim != 2 or min(A.shape) < 1 or A.dtype not in (torch.float32, torch.float64):
             raise ValueError("A must be a real float32/float64 [m,n] tensor")
@@ -252,6 +253,8 @@ class SALISTA(nn.Module):
             raise ValueError("free_threshold must be a bool")
         if type(free_step) is not bool:
             raise ValueError("free_step must be a bool")
+        if type(free_momentum) is not bool:
+            raise ValueError("free_momentum must be a bool")
         controls = (initial_l1_bound, noise_l2_bound, gamma_min, gamma_max, beta_max, eta)
         if (not all(type(v) in (float, int) and math.isfinite(v) for v in controls)
                 or min(initial_l1_bound, noise_l2_bound, beta_max, eta) < 0
@@ -266,6 +269,7 @@ class SALISTA(nn.Module):
         self.stall_threshold_ratio = stall_threshold_ratio
         self.free_threshold = free_threshold
         self.free_step = free_step
+        self.free_momentum = free_momentum
         self.depth, self.sharing = depth, sharing
         blocks = 1 if sharing == "shared" else depth
         self.layers = nn.ModuleList(CoordinateController(cell, hidden_size, sharing == "shared" or i > 0)
@@ -285,7 +289,9 @@ class SALISTA(nn.Module):
         previous_x = x
         budget = y.new_full((len(y), 1), self.initial_l1_bound)
         previous_budget = budget
-        support_certified = torch.ones_like(budget, dtype=torch.bool)
+        # Free thresholds retain the historical sparse-budget feature for checkpoint compatibility.
+        # Only trajectories using the certificate threshold can claim support inclusion.
+        use_sparse_budget = torch.ones_like(budget, dtype=torch.bool)
         state = None  # The cell initializes zeros for each new observation batch.
         path, diagnostics = [], []
         for i in range(depth):
@@ -296,8 +302,8 @@ class SALISTA(nn.Module):
                 error, interference = cert.coordinate_bounds(c, budget, self.noise_l2_bound, gram_available)
                 if self.stall_threshold_ratio is not None and gram_available:
                     # After a relaxation the error support may exceed s. Use only l1-based bounds.
-                    error = torch.where(support_certified, error, budget)
-                    interference = torch.where(support_certified, interference, cert.fallback_factor * budget)
+                    error = torch.where(use_sparse_budget, error, budget)
+                    interference = torch.where(use_sparse_budget, interference, cert.fallback_factor * budget)
                 global_features = torch.stack((r.abs().sum(1), c.abs().sum(1), c.abs().amax(1),
                                                change.abs().sum(1), budget[:, 0]), dim=1)
                 local_features = torch.stack((x, c, change, error.log1p(), cert.q.expand_as(x),
@@ -309,7 +315,10 @@ class SALISTA(nn.Module):
                     gamma = F.softplus(step_raw)
                 else:
                     gamma = self.gamma_min + (self.gamma_max - self.gamma_min) * step_raw.sigmoid()
-                beta = self.beta_max * block.momentum(features).squeeze(-1).sigmoid() if i else torch.zeros_like(x)
+                beta = torch.zeros_like(x)
+                if i:
+                    raw_beta = block.momentum(features).squeeze(-1)
+                    beta = raw_beta if self.free_momentum else self.beta_max * raw_beta.sigmoid()
                 lower = gamma * (interference + self.noise_l2_bound * cert.omega)
                 threshold_features = torch.cat((features, lower.log1p().unsqueeze(-1)), dim=2)
                 proposal = F.softplus(block.threshold(threshold_features).squeeze(-1))
@@ -330,20 +339,22 @@ class SALISTA(nn.Module):
                     else:
                         theta, scale, stalled = rescale_stalled_threshold(
                             z, reference_theta, self.stall_threshold_ratio)
-                        support_certified = support_certified & ~stalled
+                        use_sparse_budget = use_sparse_budget & ~stalled
                 next_x = shrink(z, theta)
                 if i + 1 < depth or return_diagnostics:
                     triangle = self.initial_l1_bound + next_x.abs().sum(1, keepdim=True)
                     next_budget = triangle
-                    if self.stall_threshold_ratio is None or support_certified.any():
+                    if self.stall_threshold_ratio is None or use_sparse_budget.any():
+                        # The diagonal operator norm also covers signed, unbounded momentum.
+                        beta_bound = beta.abs().amax(1, keepdim=True) if self.free_momentum else self.beta_max
                         recurrence = cert.next_budget(gamma, budget, previous_budget, self.noise_l2_bound,
-                                                      self.eta, self.beta_max)
-                        next_budget = torch.where(support_certified, torch.minimum(recurrence, triangle), triangle)
+                                                      self.eta, beta_bound)
+                        next_budget = torch.where(use_sparse_budget, torch.minimum(recurrence, triangle), triangle)
                     if return_diagnostics:
                         diagnostics.append(dict(gamma=gamma, beta=beta, theta=theta, lower=lower, delta=delta,
                                                 error_bound=error, budget=budget, next_budget=next_budget,
                                                 reference_theta=reference_theta, threshold_scale=scale,
-                                                support_certified=support_certified))
+                                                support_certified=use_sparse_budget & (not self.free_threshold)))
                     previous_budget, budget = budget, next_budget
                 previous_x, x = x, next_x
             if return_path:
@@ -355,7 +366,10 @@ class SALISTA(nn.Module):
 def build_model(method, data, depth, config=None):
     if method not in METHODS or depth < 1:
         raise ValueError("Unknown method or invalid depth")
-    A, W = torch.tensor(data.A), torch.tensor(data.W)
+    A = torch.tensor(data.A)
+    if method == "AdaLISTA":
+        return AdaLISTA(A, depth, **(config or {}).get("adalista", {}))
+    W = torch.tensor(data.W)
     if method == "SALISTA":
         config = config or {}
         options = dict(config.get("salista", {}))

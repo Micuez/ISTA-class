@@ -15,7 +15,8 @@ from models import BASELINE_METHODS, NeuralALISTA, build_model, multistage_thres
 from na_training import author_batches
 from plot_single_snr import fixed_depth_metrics
 from run_single_snr_grid import grid_jobs
-from train import evaluate, fit, load_checkpoint, stages, supported_modes, tensors, test_run, trainable_parameters
+from train import (Phase, evaluate, fit, gradient_factors, load_checkpoint, stages,
+                   supported_modes, tensors, test_run, trainable_parameters)
 from verify_data import check_paired_signals, verify
 
 
@@ -96,7 +97,7 @@ class ExperimentTests(unittest.TestCase):
     def test_batch_independence_and_layer_freezing(self):
         y, x = next(self.data.batches("train", 8))
         y, x = torch.from_numpy(y), torch.from_numpy(x)
-        for method in BASELINE_METHODS:
+        for method in (*BASELINE_METHODS, "AdaLISTA"):
             with self.subTest(method=method):
                 model = build_model(method, self.data, 2)
                 if isinstance(model, NeuralALISTA):
@@ -117,9 +118,9 @@ class ExperimentTests(unittest.TestCase):
 
     def test_both_training_modes_and_checkpoint_evaluation(self):
         cfg = dict(depth=2, max_epochs_per_layer=3, max_epochs_end_to_end=2,
-                   early_stopping_patience=50, batch_size=8, learning_rate=0.001, seed=3,
+                   early_stopping_patience=25, batch_size=8, learning_rate=0.001, seed=3,
                    snr_db=5, na_batch_size=4, na_samples_per_epoch=12)
-        for method in BASELINE_METHODS:
+        for method in (*BASELINE_METHODS, "AdaLISTA"):
             for mode in supported_modes(method):
                 with self.subTest(method=method, mode=mode):
                     dest = self.root / method / mode
@@ -147,7 +148,7 @@ class ExperimentTests(unittest.TestCase):
 
     def test_formal_budget_and_grid(self):
         config = json.loads(Path(__file__).with_name("training.json").read_text())
-        self.assertEqual(config["early_stopping_patience"], 50)
+        self.assertEqual(config["early_stopping_patience"], 25)
         self.assertEqual(stages("end_to_end", config)[0].epochs, 100000)
         phases = stages("layerwise", config)
         self.assertEqual(len(phases), 48)
@@ -162,21 +163,21 @@ class ExperimentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "supports"):
             stages("layerwise", config, "NA-ALISTA")
 
-    def test_fifty_misses_and_best_weights(self):
+    def test_twenty_five_misses_and_best_weights(self):
         cfg = dict(depth=1, max_epochs_per_layer=3, max_epochs_end_to_end=60,
-                   early_stopping_patience=50, batch_size=8, learning_rate=0.001, seed=3, snr_db=5)
-        trace = iter([1.0, 1.0, 0.9] + [0.9, 1.0] * 25)
+                   early_stopping_patience=25, batch_size=8, learning_rate=0.001, seed=3, snr_db=5)
+        trace = iter([1.0, 1.0, 0.9] + [0.9, 1.0] * 13)
         seen = []
         def validation(model, data, split, depth, batch_size, device):
             self.assertEqual(split, "val")
             seen.append({k: v.detach().clone() for k, v in model.state_dict().items()})
             return {}, next(trace)
-        out = self.root / "fifty"
+        out = self.root / "patience-25"
         with patch("train.evaluate", new=validation):
             fit(self.data, "ALISTA", "end_to_end", cfg, "cpu", out, "id")
         stage, = json.loads((out / "run.json").read_text())["stages"]
         self.assertEqual((stage["epochs_run"], stage["best_epoch"], stage["stop_reason"]),
-                         (53, 3, "validation_patience"))
+                         (28, 3, "validation_patience"))
         for name, value in torch.load(out / "best.pt", weights_only=True).items():
             torch.testing.assert_close(value, seen[2][name], rtol=0, atol=0)
 
@@ -192,12 +193,22 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual([s["best_epoch"] for s in records], [3, 3, 6])
         self.assertEqual(records[0]["stop_reason"], "epoch_limit")
         y, x = next(tensors(self.data, "train", 8, "cpu", level=5))
-        for method in ("ELISTA", "ALISTA", "EBT-LISTA", "HLISTA"):
+        for method in ("ELISTA", "ALISTA", "EBT-LISTA", "HLISTA", "AdaLISTA"):
             net = build_model(method, self.data, 3)
             params = trainable_parameters(net, "joint_1", 2)
             self.assertTrue(any(n.startswith("layers.0.") for n in params))
             self.assertFalse(any(n.startswith("layers.2.") for n in params))
             self.assertEqual("shared_weight" in params, method == "ELISTA")
+            if method == "AdaLISTA":
+                weights = {f"shared_matrices.{i}" for i in range(len(net.shared_matrices))}
+                self.assertEqual(len(weights), 2)
+                self.assertTrue(weights <= params.keys())
+                factors = {id(p): multiplier for p, multiplier in
+                           gradient_factors(params, Phase(2, "joint_1", 1, .001), .3)}
+                self.assertTrue(all(factors[id(params[w])] == .3 for w in weights))
+                self.assertTrue(weights <= trainable_parameters(net, "new_layer", 1).keys())
+                self.assertTrue(weights.isdisjoint(trainable_parameters(net, "new_layer", 2)))
+                params = trainable_parameters(net, "joint_1", 2)
             prefix_before = [p.detach().clone() for p in net.layers[0].parameters()]
             opt = torch.optim.Adam(params.values(), lr=1e-4)
             (net(y, 2) - x).square().mean().backward()

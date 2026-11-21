@@ -1,4 +1,4 @@
-"""Train and evaluate the baseline grid or the 48-run six-method comparison."""
+"""Train and evaluate single-SNR sparse recovery comparisons."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -23,11 +23,11 @@ SNRS = (40, 20, 10, 5, float("inf"))
 
 
 def grid_jobs(preset="baseline"):
-    comparison = preset == "six-methods"
-    levels = SNRS[:-1] if comparison else SNRS
-    methods = METHODS if comparison else BASELINE_METHODS
+    methods = {"baseline": BASELINE_METHODS, "six-methods": (*BASELINE_METHODS, "SALISTA"),
+               "seven-methods": METHODS}[preset]
+    levels = SNRS if preset == "baseline" else SNRS[:-1]
     return [(method, mode, snr) for snr in levels for method in methods
-            for mode in supported_modes(method, na_shared_prefix=comparison)]
+            for mode in supported_modes(method)]
 
 
 def write_test_summary(out, jobs, seed):
@@ -64,7 +64,7 @@ def devices(device):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--preset", choices=("baseline", "six-methods"), default="baseline")
+    parser.add_argument("--preset", choices=("baseline", "six-methods", "seven-methods"), default="baseline")
     parser.add_argument("--dry-run", action="store_true", help="list the resolved jobs without training or opening any data")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--config", type=Path)
@@ -74,18 +74,19 @@ def main():
     parser.add_argument("--na-schedule", choices=("experiment", "author"))
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     args = parser.parse_args()
-    comparison = args.preset == "six-methods"
+    comparison = args.preset != "baseline"
     args.config = args.config or ROOT / ("training.comparison.json" if comparison else "training.json")
     cfg = json.loads(args.config.read_text(encoding="utf-8"))
     if args.na_schedule:
         cfg["na_schedule"] = args.na_schedule
-    if comparison and not (cfg.get("paired_author_online") and cfg.get("na_shared_prefix") and
+    if comparison and not (cfg.get("paired_author_online") and
                            cfg.get("salista", {}).get("bounds", {}).get("mode") == "online_gaussian"):
-        parser.error("six-methods needs the paired online, shared prefix, and online_gaussian comparison settings")
+        parser.error(f"{args.preset} requires paired_author_online and online_gaussian comparison settings")
     args.seed = cfg["seed"] if args.seed is None else args.seed
     if not 0 <= args.seed < 2**32:
         parser.error("seed must be in [0, 2**32)")
-    args.out = args.out or (Path(f"runs/six-methods-seed-{args.seed}") if comparison else DEFAULT_RUNS)
+    output_name = "six-methods-na-e2e" if args.preset == "six-methods" else args.preset
+    args.out = args.out or (Path(f"runs/{output_name}-seed-{args.seed}") if comparison else DEFAULT_RUNS)
     jobs = grid_jobs(args.preset)
     for method, mode in dict.fromkeys((m, mode) for m, mode, _ in jobs):
         stages(mode, cfg, method)
@@ -147,8 +148,6 @@ def main():
     plot = [sys.executable, str(ROOT / "plot_single_snr.py"), "--runs", str(out), "--data-main", str(main_data),
             "--data-noiseless", str(clean_data), "--device", args.device, "--seed", str(args.seed),
             "--snrs", *map(level_key, levels), "--methods", *dict.fromkeys(m for m, _, _ in jobs)]
-    if comparison:
-        plot.append("--include-na-prefix")
     subprocess.run(plot, check=True)
     print(f"Completed {len(jobs)} runs; figures in {out / 'figures'}")
 

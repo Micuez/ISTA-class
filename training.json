@@ -2,7 +2,7 @@
   "depth": 16,
   "max_epochs_per_layer": 1000,
   "max_epochs_end_to_end": 100000,
-  "early_stopping_patience": 50,
+  "early_stopping_patience": 25,
   "batch_size": 64,
   "learning_rate": 0.001,
   "layerwise_learning_rate": 0.0005,

@@ -2,7 +2,7 @@
   "depth": 16,
   "max_epochs_per_layer": 1000,
   "max_epochs_end_to_end": 100000,
-  "early_stopping_patience": 50,
+  "early_stopping_patience": 25,
   "batch_size": 64,
   "learning_rate": 0.001,
   "layerwise_learning_rate": 0.0005,
@@ -10,7 +10,6 @@
   "older_layer_gradient_decay": 0.3,
   "seed": 20261118,
   "na_schedule": "experiment",
-  "na_shared_prefix": true,
   "paired_author_online": true,
   "na_batch_size": 512,
   "na_samples_per_epoch": 50000,
@@ -26,6 +25,7 @@
     "stall_threshold_ratio": 0.8,
     "free_threshold": true,
     "free_step": true,
+    "free_momentum": false,
     "bounds": {"mode": "online_gaussian", "failure_probability": 0.01}
   }
 }
